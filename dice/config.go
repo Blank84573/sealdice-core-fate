@@ -13,8 +13,10 @@ import (
 	"sync"
 	"time"
 
-	wr "github.com/mroth/weightedrand"
+	wr "github.com/mroth/weightedrand/v3"
 	"gopkg.in/yaml.v3"
+
+	"github.com/bytedance/sonic"
 
 	"sealdice-core/dice/service"
 	"sealdice-core/logger"
@@ -431,8 +433,8 @@ func (cm *ConfigManager) Load() error {
 	return nil
 }
 
-func (i *TextTemplateItemList) toRandomPool() *wr.Chooser {
-	var choices []wr.Choice
+func (i *TextTemplateItemList) toRandomPool() *wr.Chooser[string, uint] {
+	var choices []wr.Choice[string, uint]
 	for _, i := range *i {
 		// weight, text := extractWeight(i)
 		if len(i) == 1 {
@@ -441,11 +443,11 @@ func (i *TextTemplateItemList) toRandomPool() *wr.Chooser {
 		}
 
 		if w, ok := i[1].(int); ok {
-			choices = append(choices, wr.Choice{Item: i[0].(string), Weight: uint(w)})
+			choices = append(choices, wr.NewChoice(i[0].(string), uint(w)))
 		}
 
 		if w, ok := i[1].(float64); ok {
-			choices = append(choices, wr.Choice{Item: i[0].(string), Weight: uint(w)})
+			choices = append(choices, wr.NewChoice(i[0].(string), uint(w)))
 		}
 	}
 	randomPool, _ := wr.NewChooser(choices...)
@@ -2062,13 +2064,13 @@ func setupTextTemplate(d *Dice) {
 
 func (d *Dice) GenerateTextMap() {
 	// 生成TextMap
-	newTextMap := map[string]*wr.Chooser{}
+	newTextMap := map[string]*wr.Chooser[string, uint]{}
 
 	for category, item := range d.TextMapRaw {
 		for k, v := range item {
-			var choices []wr.Choice
+			var choices []wr.Choice[string, uint]
 			for _, textItem := range v {
-				choices = append(choices, wr.Choice{Item: textItem[0].(string), Weight: getNumVal(textItem[1])})
+				choices = append(choices, wr.NewChoice(textItem[0].(string), getNumVal(textItem[1])))
 			}
 
 			pool, _ := wr.NewChooser(choices...)
@@ -2076,10 +2078,10 @@ func (d *Dice) GenerateTextMap() {
 		}
 	}
 
-	picker, _ := wr.NewChooser(wr.Choice{Item: APPNAME, Weight: 1})
+	picker, _ := wr.NewChooser(wr.NewChoice(APPNAME, uint(1)))
 	newTextMap["常量:APPNAME"] = picker
 
-	picker, _ = wr.NewChooser(wr.Choice{Item: VERSION.String(), Weight: 1})
+	picker, _ = wr.NewChooser(wr.NewChoice(VERSION.String(), uint(1)))
 	newTextMap["常量:VERSION"] = picker
 
 	d.TextMap = newTextMap
@@ -2156,53 +2158,8 @@ func (d *Dice) loads() {
 			}
 		}
 		d.DiceMasters = newDiceMasters
-		// 装载ServiceAtNew
-		// Pinenutn: So,我还是不知道ServiceAtNew到底是个什么鬼东西……太反直觉了……
-		d.ImSession.ServiceAtNew = new(SyncMap[string, *GroupInfo])
-		err = service.GroupInfoListGet(d.DBOperator, func(id string, updatedAt int64, data []byte) {
-			var groupInfo GroupInfo
-			err = json.Unmarshal(data, &groupInfo)
-			if err == nil {
-				groupInfo.GroupID = id
-				groupInfo.UpdatedAtTime = 0
-
-				// 初始化 nil 字段（加载时初始化，避免单独遍历）
-				if groupInfo.DiceIDActiveMap == nil {
-					groupInfo.DiceIDActiveMap = new(SyncMap[string, bool])
-				}
-				if groupInfo.DiceIDExistsMap == nil {
-					groupInfo.DiceIDExistsMap = new(SyncMap[string, bool])
-				}
-				if groupInfo.BotList == nil {
-					groupInfo.BotList = new(SyncMap[string, bool])
-				}
-				if groupInfo.InactivatedExtSet == nil {
-					groupInfo.InactivatedExtSet = StringSet{}
-				}
-
-				// 找出其中以群号开头的，这是1.2版本的bug
-				var toDelete []string
-				if groupInfo.DiceIDExistsMap != nil {
-					groupInfo.DiceIDExistsMap.Range(func(key string, value bool) bool {
-						if strings.HasPrefix(key, "QQ-Group:") {
-							toDelete = append(toDelete, key)
-						}
-						return true
-					})
-					for _, i := range toDelete {
-						groupInfo.DiceIDExistsMap.Delete(i)
-					}
-				}
-				d.ImSession.ServiceAtNew.Store(id, &groupInfo)
-			} else {
-				d.Logger.Errorf("加载群信息失败: %s", id)
-			}
-		})
-		if err != nil {
-			d.Logger.Errorf("加载群信息失败 %s", err)
-		}
-		// 延迟加载：不再遍历群组替换扩展对象，改为在 GetActivatedExtList 中延迟处理
-		// nil 字段初始化已移至 GroupInfoListGet 回调中，避免单独遍历
+		// 群组数据加载已移至 loadGroups：需等待内置扩展、JS 插件、扩展包全部注册后进行，
+		// 使 activatedExtList 在反序列化时即可解析为全局共享的 ExtInfo 指针
 
 		if config.VersionCode != 0 && config.VersionCode < 10005 {
 			d.RunAfterLoaded = append(d.RunAfterLoaded, func() {
@@ -2307,33 +2264,6 @@ func (d *Dice) loads() {
 		})
 
 		d.Config = config
-
-		// 1.4.5 版本 - 覆写lagrange配置
-		// for _, i := range d.ImSession.EndPoints {
-		// 	if i.ProtocolType == "onebot" {
-		// 		pa := i.Adapter.(*PlatformAdapterGocq)
-		// 		if pa.BuiltinMode == "lagrange" {
-		// 			signServerUrl, signServerVersion := RWLagrangeSignServerUrl(d, i, "sealdice", false, "30366")
-		// 			if signServerUrl != "" {
-		// 				// 版本为空，覆写为 "30366"
-		// 				if signServerVersion == "" {
-		// 					RWLagrangeSignServerUrl(d, i, "sealdice", true, "30366")
-		// 				}
-		// 			}
-		// 		}
-		// 	}
-		// }
-
-		// 设置全局群名缓存和用户名缓存
-		dm := d.Parent
-		now := time.Now().Unix()
-		// Pinenutn: Range模板 ServiceAtNew重构代码
-		d.ImSession.ServiceAtNew.Range(func(key string, groupInfo *GroupInfo) bool {
-			// Pinenutn: ServiceAtNew重构
-			// Pinenutn: 这里曾经可能是个Lockfree.hashmap？ 函数有变动
-			dm.GroupNameCache.Store(key, &GroupNameCacheItem{Name: groupInfo.GroupName, time: now})
-			return true
-		})
 		d.Logger.Info("serve.yaml loaded")
 	} else {
 		d.Logger.Info("serve.yaml not found")
@@ -2354,8 +2284,7 @@ func (d *Dice) loads() {
 	})
 
 	for _, i := range d.ImSession.EndPoints {
-		i.Session = d.ImSession
-		i.AdapterSetup()
+		i.BindRuntime(d.ImSession)
 	}
 	d.warnIfNoPlatformEndpoint(missingPlatformConfigInServe)
 
@@ -2369,13 +2298,92 @@ func (d *Dice) loads() {
 	d.MarkModified()
 }
 
+// loadGroups 加载群组数据。
+// 必须在内置扩展、JS 插件、扩展包全部注册完成后调用（见 Dice.Init）：
+// 此时 ExtRegistry 完整，反序列化 activatedExtList 可直接解析为全局共享的
+// ExtInfo 指针，避免每个群持有大量占位 ExtInfo 对象（约 416B/个）常驻内存。
+func (d *Dice) loadGroups() {
+	d.ImSession.ServiceAtNew = new(SyncMap[string, *GroupInfo])
+
+	// 显式预热 sonic 编译缓存，避免首个群反序列化时 JIT 编译卡顿
+	_ = sonic.Pretouch(reflect.TypeOf(groupInfoDecodeJSON{}))
+	_ = sonic.Pretouch(reflect.TypeOf(extNameRefsJSON{}))
+
+	// json 解码无法传递 Dice 上下文，加载期间临时提供 name -> *ExtInfo 解析器
+	// 已删除（IsDeleted）的 wrapper 同样返回：它是共享对象，保留群的开启状态
+	prevResolver := extJSONResolver
+	extJSONResolver = func(name string) *ExtInfo {
+		if d.ExtRegistry == nil {
+			return nil
+		}
+		if ext, ok := d.ExtRegistry.Load(name); ok && ext != nil {
+			return ext
+		}
+		return nil
+	}
+	defer func() { extJSONResolver = prevResolver }()
+
+	err := service.GroupInfoListGet(d.DBOperator, func(id string, _ int64, data []byte) {
+		var groupInfo GroupInfo
+		if err := sonic.Unmarshal(data, &groupInfo); err != nil {
+			d.Logger.Errorf("加载群信息失败: %s", id)
+			return
+		}
+		groupInfo.GroupID = id
+		groupInfo.UpdatedAtTime = 0
+
+		// 初始化 nil 字段（加载时初始化，避免单独遍历）
+		if groupInfo.DiceIDActiveMap == nil {
+			groupInfo.DiceIDActiveMap = new(SyncMap[string, bool])
+		}
+		if groupInfo.DiceIDExistsMap == nil {
+			groupInfo.DiceIDExistsMap = new(SyncMap[string, bool])
+		}
+		if groupInfo.BotList == nil {
+			groupInfo.BotList = new(SyncMap[string, bool])
+		}
+		if groupInfo.InactivatedExtSet == nil {
+			groupInfo.InactivatedExtSet = StringSet{}
+		}
+
+		// 找出其中以群号开头的，这是1.2版本的bug
+		var toDelete []string
+		groupInfo.DiceIDExistsMap.Range(func(key string, _ bool) bool {
+			if strings.HasPrefix(key, "QQ-Group:") {
+				toDelete = append(toDelete, key)
+			}
+			return true
+		})
+		for _, i := range toDelete {
+			groupInfo.DiceIDExistsMap.Delete(i)
+		}
+		d.ImSession.ServiceAtNew.Store(id, &groupInfo)
+	})
+	if err != nil {
+		d.Logger.Errorf("加载群信息失败 %s", err)
+	}
+
+	// 设置全局群名缓存和用户名缓存
+	dm := d.Parent
+	now := time.Now().Unix()
+	// Pinenutn: Range模板 ServiceAtNew重构代码
+	d.ImSession.ServiceAtNew.Range(func(key string, groupInfo *GroupInfo) bool {
+		// Pinenutn: ServiceAtNew重构
+		// Pinenutn: 这里曾经可能是个Lockfree.hashmap？ 函数有变动
+		dm.GroupNameCache.Store(key, &GroupNameCacheItem{Name: groupInfo.GroupName, time: now})
+		return true
+	})
+}
+
 func (d *Dice) loadIMSessionEndpoints(imSession *IMSession) bool {
 	if imSession == nil || imSession.EndPoints == nil {
 		d.ImSession.EndPoints = make([]*EndPointInfo, 0)
+		d.ImSession.RefreshEndPointsSnapshot()
 		return true
 	}
 
 	d.ImSession.EndPoints = imSession.EndPoints
+	d.ImSession.RefreshEndPointsSnapshot()
 	return false
 }
 
@@ -2417,20 +2425,86 @@ func (d *Dice) loadAdvanced() {
 }
 
 func (d *Dice) SaveText() {
-	buf, err := yaml.Marshal(d.TextMapRaw)
+	buf, err := marshalTextTemplate(d.TextMapRaw)
 	if err != nil {
 		d.Logger.Error("Dice.SaveText", err)
-	} else {
-		newFn := filepath.Join(d.BaseConfig.DataDir, "configs/text-template.yaml")
-		bakFn := filepath.Join(d.BaseConfig.DataDir, "configs/text-template.yaml.bak")
-		// ioutil.WriteFile(filepath.Join(d.BaseConfig.DataDir, "configs/text-template.yaml"), buf, 0644)
-		current, err := os.ReadFile(newFn)
-		if err != nil {
-			_ = os.WriteFile(bakFn, current, 0o644) //nolint:gosec
-		}
-
-		_ = os.WriteFile(newFn, buf, 0o644)
+		return
 	}
+
+	newFn := filepath.Join(d.BaseConfig.DataDir, "configs/text-template.yaml")
+	if err := saveTextTemplateFile(newFn, buf); err != nil {
+		d.Logger.Error("Dice.SaveText", err)
+	}
+}
+
+func marshalTextTemplate(texts TextTemplateWithWeightDict) (buf []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			buf = nil
+			err = fmt.Errorf("序列化文案失败: %v", recovered)
+		}
+	}()
+
+	buf, err = yaml.Marshal(texts)
+	if err != nil {
+		return nil, fmt.Errorf("序列化文案失败: %w", err)
+	}
+
+	// 再次解析序列化结果，避免异常数据覆盖掉现有文案文件。
+	var parsed TextTemplateWithWeightDict
+	if err := yaml.Unmarshal(buf, &parsed); err != nil {
+		return nil, fmt.Errorf("校验生成的文案 YAML 失败: %w", err)
+	}
+	return buf, nil
+}
+
+func saveTextTemplateFile(filename string, data []byte) error {
+	dir := filepath.Dir(filename)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("创建文案目录失败: %w", err)
+	}
+
+	current, err := os.ReadFile(filename)
+	if err == nil {
+		backupErr := writeFileAtomically(filename+".bak", current, 0o644)
+		if backupErr != nil {
+			return fmt.Errorf("备份文案文件失败: %w", backupErr)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("读取现有文案文件失败: %w", err)
+	}
+
+	if err := writeFileAtomically(filename, data, 0o644); err != nil {
+		return fmt.Errorf("写入文案文件失败: %w", err)
+	}
+	return nil
+}
+
+func writeFileAtomically(filename string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(filename), "."+filepath.Base(filename)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName) //nolint:gosec
+	}()
+
+	if err := tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tmpName, filename)
 }
 
 // ApplyExtDefaultSettings 应用扩展默认配置，同时处理插件的启用和禁用
@@ -2503,6 +2577,7 @@ func (d *Dice) ApplyExtDefaultSettings() {
 }
 
 func (d *Dice) Save(isAuto bool) {
+	d.ImSession.RefreshEndPointsSnapshot()
 	saveStartTime := time.Now()
 
 	configStartTime := time.Now()

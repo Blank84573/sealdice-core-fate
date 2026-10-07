@@ -24,8 +24,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-
-	"golang.org/x/exp/rand"
 )
 
 type VMValueType int
@@ -79,8 +77,6 @@ type RollConfig struct {
 	DisableStmts     bool // 禁用语句语法(如if while等)，仅允许表达式
 	DisableNDice     bool // 禁用Nd语法，即只能2d6这样写，不能写2d
 
-	ValueStoreSource string // ValueStoreSource 用于区分来源以便于 HookValueStore 的调用判断持久化方式
-
 	// 如果返回值为true，那么跳过剩下的储存流程。如果overwrite不为nil，对v进行覆盖。
 	// 另注: 钩子函数中含有ctx的原因是可能在函数中进行调用，此时ctx会发生变化
 	HookValueStore func(ctx *Context, name string, v *VMValue) (overwrite *VMValue, solved bool)
@@ -109,7 +105,7 @@ type RollConfig struct {
 	DiceMaxMode bool // 以最大值结算 获取上界
 
 	// FateExpectation 命运流向: 单颗骰子的目标期望值(1~面数)。为0时表示不偏移(均匀分布/原版行为)。
-	// 通过幂律映射 floor(N * u^k)+1 实现, k = (N-E)/(E-1), 使任意面数dN的期望≈FateExpectation按比例缩放。
+	// 通过幂律映射 floor(N * u^k)+1 实现, 使任意面数dN的期望≈FateExpectation按比例缩放。
 	FateExpectation float64
 }
 
@@ -178,8 +174,8 @@ type Context struct {
 	detailCache      string // 计算过程
 	IsComputedLoaded bool
 
-	Seed    []byte          // 随机种子，16个字节，即双uint64
-	RandSrc *rand.PCGSource // 根据种子生成的source
+	Seed    []byte     // PCG随机状态，16个字节，即双uint64
+	RandSrc DiceSource // 随机源
 
 	IsRunning      bool // 是否正在运行，Run时会置为true，halt时会置为false
 	CustomDiceInfo []*customDiceItem
@@ -230,17 +226,18 @@ func (ctx *Context) Init() {
 	ctx.DetailSpans = nil
 	ctx.CustomFlag = make(map[string]any)
 	if ctx.Seed != nil {
-		s := rand.PCGSource{}
-		_ = s.UnmarshalBinary(ctx.Seed)
-		ctx.RandSrc = &s
+		src, _ := NewPCGDiceSourceFromState(ctx.Seed)
+		ctx.RandSrc = src
 	}
 }
 
 func (ctx *Context) GetCurSeed() ([]byte, error) {
-	if ctx.RandSrc != nil {
-		return ctx.RandSrc.MarshalBinary()
+	src := normalizeDiceSource(ctx.RandSrc)
+	statefulSrc, ok := src.(StatefulDiceSource)
+	if !ok {
+		return nil, ErrDiceSourceStateUnsupported
 	}
-	return randSource.MarshalBinary()
+	return statefulSrc.MarshalBinary()
 }
 
 func (ctx *Context) loadInnerVar(name string) *VMValue {

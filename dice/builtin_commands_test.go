@@ -84,7 +84,7 @@ func (h *milkyRESTHarness) handle(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			h.t.Fatalf("failed to decode get_group_member_info payload: %v", err)
 		}
-		if payload.GroupID != h.expectedGroupID || payload.UserID != h.expectedUserID || payload.NoCache {
+		if payload.GroupID != h.expectedGroupID || payload.UserID != h.expectedUserID || !payload.NoCache {
 			h.t.Fatalf("unexpected get_group_member_info payload: %#v", payload)
 		}
 		if h.apiError != "" {
@@ -375,9 +375,9 @@ func newMilkyQuitCommandTestContext(t *testing.T, d *Dice, senderID, groupID, gr
 		},
 	}
 	pa.EndPoint = ep
-	pa.Session = d.ImSession
 	pa.IntentSession = session
 	ep.Adapter = pa
+	ep.BindRuntime(d.ImSession)
 
 	d.Config.BotExitWithoutAt = true
 	ctx, msg := newQuitCommandTestContext(t, d, ep, senderID, groupID, groupName)
@@ -432,9 +432,9 @@ func TestDismissMilkyLookupErrorFallsBackToSafetyConfirmation(t *testing.T) {
 		},
 	}
 	pa.EndPoint = ep
-	pa.Session = d.ImSession
 	pa.IntentSession = session
 	ep.Adapter = pa
+	ep.BindRuntime(d.ImSession)
 
 	d.Config.BotExitWithoutAt = true
 	ctx, msg := newQuitCommandTestContext(t, d, ep, "QQ:9020", testMilkyFallbackGroupID, "MilkyFallbackGroup")

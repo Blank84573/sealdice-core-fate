@@ -7,20 +7,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
-
-	"golang.org/x/exp/rand"
 )
 
-func getSource() *rand.PCGSource {
-	s := &rand.PCGSource{}
-	s.Seed(uint64(time.Now().UnixMilli()))
-	return s
-}
-
-var randSource = getSource()
-
-func _roll32(src *rand.PCGSource, dicePoints int) int {
+func _roll32(src DiceSource, dicePoints int) int {
 	// 注: int的长度至少为32位，也可以高于此数，此处只是当作32位处理
 	if dicePoints > math.MaxInt32-1 {
 		return 0
@@ -41,7 +30,7 @@ func _roll32(src *rand.PCGSource, dicePoints int) int {
 	return int(v%n + 1)
 }
 
-func _roll64(src *rand.PCGSource, dicePoints int64, mod int) int64 {
+func _roll64(src DiceSource, dicePoints int64, mod int) int64 {
 	if dicePoints > math.MaxInt64-1 {
 		return 0
 	}
@@ -63,20 +52,15 @@ func _roll64(src *rand.PCGSource, dicePoints int64, mod int) int64 {
 
 // fateRoll 命运流向: 根据目标期望 expectation 对一颗 dN 骰做偏态映射。
 // 原理: 生成均匀随机数后, 用幂律 result = floor(N * u^k) + 1 改变分布形态。
-// k = ln(E/N) / ln((N+0.5)/(N+1))... 这里采用近似实用解: 通过期望反推指数 k,
-// 使得 dN 的平均出目趋近 expectation。expectation<=0 或非法时退回均匀分布。
-func fateRoll(src *rand.PCGSource, dicePoints IntType, expectation float64) IntType {
+// 通过期望反推指数 k, 使 dN 的平均出目趋近 expectation。expectation<=0 或非法时退回均匀分布。
+func fateRoll(src DiceSource, dicePoints IntType, expectation float64) IntType {
 	n := float64(dicePoints)
 	if expectation <= 0 || n <= 1 {
-		// 不偏移
 		if IntTypeSize == 8 {
 			return IntType(_roll64(src, int64(dicePoints), 0))
 		}
 		return IntType(_roll32(src, int(dicePoints)))
 	}
-
-	// 将目标期望按比例缩放到当前面数: 期望基准是 d100 的 expectation, 对 dN 取等比例。
-	// 即目标均值 target = expectation/100 * N, 再 clamp 到 [1, N]。
 	target := expectation / 100.0 * n
 	if target < 1 {
 		target = 1
@@ -84,15 +68,10 @@ func fateRoll(src *rand.PCGSource, dicePoints IntType, expectation float64) IntT
 	if target > n {
 		target = n
 	}
-
-	// 连续均匀分布 U(0,1) 经 u^k 变换后期望为 1/(k+1), 映射到 [0,N] 区间均值为 N/(k+1)。
-	// 令 N/(k+1) = target => k = N/target - 1。
 	k := n/target - 1
 	if k <= 0 {
 		k = 0.0001
 	}
-
-	// 生成 [0,1) 均匀随机数 u
 	u := float64(src.Uint64()>>11) / float64(1<<53)
 	val := math.Floor(n*math.Pow(u, k)) + 1
 	if val < 1 {
@@ -104,12 +83,12 @@ func fateRoll(src *rand.PCGSource, dicePoints IntType, expectation float64) IntT
 	return IntType(val)
 }
 
-func Roll(src *rand.PCGSource, dicePoints IntType, mod int) IntType {
+func Roll(src DiceSource, dicePoints IntType, mod int) IntType {
 	return RollFate2(src, dicePoints, mod, 0)
 }
 
 // RollFate2 命运流向版的 Roll: 多一个 expectation 参数控制期望偏移。
-func RollFate2(src *rand.PCGSource, dicePoints IntType, mod int, expectation float64) IntType {
+func RollFate2(src DiceSource, dicePoints IntType, mod int, expectation float64) IntType {
 	if dicePoints == 0 {
 		return 0
 	}
@@ -119,9 +98,7 @@ func RollFate2(src *rand.PCGSource, dicePoints IntType, mod int, expectation flo
 	if mod == 1 {
 		return dicePoints
 	}
-	if src == nil {
-		src = randSource
-	}
+	src = normalizeDiceSource(src)
 
 	if expectation > 0 {
 		return fateRoll(src, dicePoints, expectation)
@@ -164,7 +141,7 @@ func wodCheck(e *Context, addLine IntType, pool IntType, points IntType, thresho
 }
 
 // RollWoD 返回: 成功数，总骰数，轮数，细节
-func RollWoD(src *rand.PCGSource, addLine IntType, pool IntType, points IntType, threshold IntType, isGE bool, mode int, expectation float64) (IntType, IntType, IntType, string) {
+func RollWoD(src DiceSource, addLine IntType, pool IntType, points IntType, threshold IntType, isGE bool, mode int, expectation float64) (IntType, IntType, IntType, string) {
 	var details []string
 	addTimes := 1
 
@@ -263,7 +240,7 @@ func doubleCrossCheck(ctx *Context, addLine, pool, points IntType) bool {
 	return true
 }
 
-func RollDoubleCross(src *rand.PCGSource, addLine IntType, pool IntType, points IntType, mode int, expectation float64) (IntType, IntType, IntType, string) {
+func RollDoubleCross(src DiceSource, addLine IntType, pool IntType, points IntType, mode int, expectation float64) (IntType, IntType, IntType, string) {
 	var details []string
 	addTimes := 1
 
@@ -340,7 +317,7 @@ func RollDoubleCross(src *rand.PCGSource, addLine IntType, pool IntType, points 
 }
 
 // RollCommon (times)d(dicePoints)kl(lowNum) 或 (times)d(dicePoints)kh(highNum)
-func RollCommon(src *rand.PCGSource, times, dicePoints IntType, diceMin, diceMax *IntType, isKeepLH, lowNum, highNum IntType, mode int, expectation float64) (IntType, string) {
+func RollCommon(src DiceSource, times, dicePoints IntType, diceMin, diceMax *IntType, isKeepLH, lowNum, highNum IntType, mode int, expectation float64) (IntType, string) {
 	var nums []IntType
 	for i := IntType(0); i < times; i += 1 {
 		die := RollFate2(src, dicePoints, mode, expectation)
@@ -425,7 +402,7 @@ func RollCommon(src *rand.PCGSource, times, dicePoints IntType, diceMin, diceMax
 	return num, text
 }
 
-func RollCoC(src *rand.PCGSource, isBonus bool, diceNum IntType, mode int, expectation float64) (IntType, string) {
+func RollCoC(src DiceSource, isBonus bool, diceNum IntType, mode int, expectation float64) (IntType, string) {
 	diceResult := RollFate2(src, 100, mode, expectation)
 	diceTens := diceResult / 10
 	diceUnits := diceResult % 10
@@ -475,7 +452,7 @@ func RollCoC(src *rand.PCGSource, isBonus bool, diceNum IntType, mode int, expec
 	}
 }
 
-func RollFate(src *rand.PCGSource, mode int, expectation float64) (IntType, string) {
+func RollFate(src DiceSource, mode int, expectation float64) (IntType, string) {
 	detail := ""
 	sum := IntType(0)
 	for i := 0; i < 4; i++ {

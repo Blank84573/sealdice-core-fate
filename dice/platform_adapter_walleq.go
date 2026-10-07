@@ -25,7 +25,6 @@ import (
 
 type PlatformAdapterWalleQ struct {
 	EndPoint        *EndPointInfo       `json:"-"               yaml:"-"`
-	Session         *IMSession          `json:"-"               yaml:"-"`
 	Socket          *gowebsocket.Socket `json:"-"               yaml:"-"`
 	ConnectURL      string              `json:"connectUrl"      yaml:"connectUrl"`      // 连接地址
 	UseInPackWalleQ bool                `json:"useInPackWalleQ" yaml:"useInPackWalleQ"` // 是否使用内置的WalleQ
@@ -173,7 +172,7 @@ type OnebotV12UserInfo struct {
 func (pa *PlatformAdapterWalleQ) Serve() int {
 	pa.Implementation = "walle-q"
 	ep := pa.EndPoint
-	s := pa.Session
+	s := pa.EndPoint.Session
 	log := s.Parent.Logger
 	dm := s.Parent.Parent
 	interrupt := make(chan os.Signal, 1)
@@ -275,7 +274,7 @@ func (pa *PlatformAdapterWalleQ) Serve() int {
 			}()
 			txt := fmt.Sprintf("加入QQ群组: <%s>(%s)", groupName, event.GroupID)
 			log.Info(txt)
-			ctx.Notice(txt)
+			ctx.Notice(txt, NoticeTypeGroup)
 		}
 
 		// 入群的另一种情况: 管理员审核
@@ -338,7 +337,7 @@ func (pa *PlatformAdapterWalleQ) Serve() int {
 				}
 			}
 
-			pa.Session.Execute(pa.EndPoint, msg, false) // wq 还没有频道支持，直接执行
+			pa.EndPoint.Session.Execute(pa.EndPoint, msg, false) // wq 还没有频道支持，直接执行
 		}
 
 		//nolint:nestif
@@ -427,21 +426,21 @@ func (pa *PlatformAdapterWalleQ) Serve() int {
 
 					txt := fmt.Sprintf("被踢出群: 在QQ群组<%s>(%s)中被踢出，操作者:<%s>(%s)%s", groupName, event.GroupID, userName, n.OperatorID, extra)
 					log.Info(txt)
-					ctx.Notice(txt)
+					ctx.Notice(txt, NoticeTypeGroup)
 				}
 			case "group_member_ban": // 被禁言
 				if event.UserID == event.Self.UserID {
 					ctx.Dice.Config.BanList.AddScoreByGroupMuted(opUID, msg.GroupID, ctx)
 					txt := fmt.Sprintf("被禁言: 在群组<%s>(%s)中被禁言，时长%d秒，操作者:<%s>(%s)", groupName, msg.GroupID, n.Duration, userName, n.OperatorID)
 					log.Info(txt)
-					ctx.Notice(txt)
+					ctx.Notice(txt, NoticeTypeGroup)
 				}
 				return
 			case "group_message_delete": // 消息撤回
 				groupInfo, ok := s.ServiceAtNew.Load(msg.GroupID)
 				if ok {
-					if groupInfo.LogOn {
-						_ = service.LogMarkDeleteByMsgID(ctx.Dice.DBOperator, groupInfo.GroupID, groupInfo.LogCurName, n.MessageID)
+					if groupInfo.GetLogState().On {
+						_ = service.LogMarkDeleteByRawMsgID(ctx.Dice.DBOperator, groupInfo.GroupID, n.MessageID)
 					}
 				}
 				return
@@ -530,7 +529,7 @@ func (pa *PlatformAdapterWalleQ) Serve() int {
 
 				txt := fmt.Sprintf("收到QQ好友邀请: 邀请人:%s, 验证信息: %s, 是否自动同意: %t%s", event.UserID, comment, willAccept, extra)
 				log.Info(txt)
-				ctx.Notice(txt)
+				ctx.Notice(txt, NoticeTypeInvite)
 
 				// 忽略邀请
 				if pa.IgnoreFriendRequest {
@@ -561,7 +560,7 @@ func (pa *PlatformAdapterWalleQ) Serve() int {
 				userName := dm.TryGetUserName(uid)
 				txt := fmt.Sprintf("收到QQ加群邀请: 群组<%s>(%s) 邀请人:<%s>(%s)", groupName, event.GroupID, userName, event.UserID)
 				log.Info(txt)
-				ctx.Notice(txt)
+				ctx.Notice(txt, NoticeTypeInvite)
 				// tempInviteMap[msg.GroupId] = time.Now().Unix()
 				// tempInviteMap2[msg.GroupId] = uid
 
@@ -622,7 +621,7 @@ func (pa *PlatformAdapterWalleQ) Serve() int {
 			case "get_self_info":
 				ep.Nickname = m["user_name"].(string)
 				ep.UserID = FormatDiceIDQQV12(m["user_id"].(string))
-				d := pa.Session.Parent
+				d := pa.EndPoint.Session.Parent
 				d.LastUpdatedTime = time.Now().Unix()
 				d.Save(false)
 				return
@@ -729,7 +728,7 @@ func (pa *PlatformAdapterWalleQ) Serve() int {
 /* 标准方法实现 */
 
 func (pa *PlatformAdapterWalleQ) DoRelogin() bool {
-	d := pa.Session.Parent
+	d := pa.EndPoint.Session.Parent
 	ep := pa.EndPoint
 	if pa.Socket != nil {
 		go pa.Socket.Close()
@@ -753,7 +752,7 @@ func (pa *PlatformAdapterWalleQ) DoRelogin() bool {
 }
 
 func (pa *PlatformAdapterWalleQ) SetEnable(enable bool) {
-	d := pa.Session.Parent
+	d := pa.EndPoint.Session.Parent
 	c := pa.EndPoint
 	if enable {
 		c.Enable = true
@@ -1208,7 +1207,7 @@ func (pa *PlatformAdapterWalleQ) TextToMessageSegment(text string) []MessageSegm
 		}
 		pa2, err := filepath.Abs(path)
 		if err != nil {
-			pa.Session.Parent.Logger.Info("路径转换错误，将使用原路径", err)
+			pa.EndPoint.Session.Parent.Logger.Info("路径转换错误，将使用原路径", err)
 			pa2 = path
 		}
 		return pa2

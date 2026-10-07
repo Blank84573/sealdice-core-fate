@@ -4,8 +4,10 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
+	randv2 "math/rand/v2"
 	"regexp"
 	"runtime/debug"
 	"sort"
@@ -23,18 +25,20 @@ import (
 	"sealdice-core/model"
 	"sealdice-core/utils/dboperator/engine"
 
+	"github.com/dop251/goja"
 	"github.com/golang-module/carbon"
 	ds "github.com/sealdice/dicescript"
 	rand2 "golang.org/x/exp/rand" //nolint:staticcheck // against my better judgment, but this was mandated due to a strongly held opinion from you know who
-
-	"github.com/dop251/goja"
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
+
+	"github.com/bytedance/sonic"
 )
 
 type SenderBase struct {
 	Nickname  string `jsbind:"nickname" json:"nickname"`
 	UserID    string `jsbind:"userId"   json:"userId"`
+	IsRobot   bool   `jsbind:"isRobot"  json:"isRobot"`
 	GroupRole string `json:"-"` // 群内角色 admin管理员 owner群主
 }
 
@@ -56,6 +60,9 @@ type Message struct {
 	GroupName           string      `json:"groupName"`
 	TmpUID              string      `json:"-"             yaml:"-"`
 	UITestReplySplitLen *int        `json:"-"             yaml:"-"`
+	// MentionedInfo carries platform-provided display names keyed by normalized
+	// or legacy mention user ID. It is runtime metadata and is not persisted.
+	MentionedInfo map[string]string `json:"-" yaml:"-"`
 	// Note(Szzrain): 这里是消息段，为了支持多种消息类型，目前只有 Milky 支持，其他平台也应该尽快迁移支持，并使用 Session.ExecuteNew 方法
 	Segment []message.IMessageElement `jsbind:"segment" json:"-" yaml:"-"`
 }
@@ -67,6 +74,24 @@ type Message struct {
 // }
 
 type GroupPlayerInfo model.GroupPlayerInfoBase
+
+// extJSONResolver 在 GroupInfo 反序列化时将扩展名解析为全局共享的 *ExtInfo。
+// json 解码无法传递 Dice 上下文，由 loadGroups 在加载期间临时设置。
+var extJSONResolver func(name string) *ExtInfo
+
+// extPlaceholderPool 未安装扩展（已删除/尚未装载）的共享占位池：name -> 占位 ExtInfo。
+// 所有群对同一名字复用同一指针，避免大量群引用已删除插件时逐群分配对象；
+// 条目保留在群激活列表中，插件重装后由 GetActivatedExtList 按名恢复为真实扩展。
+var extPlaceholderPool = new(SyncMap[string, *ExtInfo])
+
+// extNamePlaceholder 返回名字对应的共享占位对象
+func extNamePlaceholder(name string) *ExtInfo {
+	if p, ok := extPlaceholderPool.Load(name); ok && p != nil {
+		return p
+	}
+	p, _ := extPlaceholderPool.LoadOrStore(name, &ExtInfo{Name: name})
+	return p
+}
 
 type GroupInfo struct {
 	Active    bool                               `jsbind:"active" json:"active" yaml:"active"` // 是否在群内开启 - 过渡为象征意义
@@ -87,10 +112,12 @@ type GroupInfo struct {
 	DiceSideExpr    string                 `json:"diceSideExpr"    yaml:"diceSideExpr"` //
 	System          string                 `json:"system"          yaml:"system"`       // 规则系统，概念同bcdice的gamesystem，距离如dnd5e coc7
 
-	HelpPackages []string `json:"helpPackages"   yaml:"-"`
-	CocRuleIndex int      `jsbind:"cocRuleIndex" json:"cocRuleIndex" yaml:"cocRuleIndex"`
-	LogCurName   string   `jsbind:"logCurName"   json:"logCurName"   yaml:"logCurFile"`
-	LogOn        bool     `jsbind:"logOn"        json:"logOn"        yaml:"logOn"`
+	HelpPackages []string      `json:"helpPackages"   yaml:"-"`
+	CocRuleIndex int           `jsbind:"cocRuleIndex" json:"cocRuleIndex" yaml:"cocRuleIndex"`
+	logStateMu   *sync.RWMutex `json:"-" yaml:"-"`
+	LogCurID     uint64        `json:"-" yaml:"-"`
+	LogCurName   string        `jsbind:"logCurName"   json:"logCurName"   yaml:"logCurFile"`
+	LogOn        bool          `jsbind:"logOn"        json:"logOn"        yaml:"logOn"`
 
 	QuitMarkAutoClean   bool   `json:"-"                     yaml:"-"` // 自动清群 - 播报，即将自动退出群组
 	QuitMarkMaster      bool   `json:"-"                     yaml:"-"` // 骰主命令退群 - 播报，即将自动退出群组
@@ -147,9 +174,15 @@ func (g *GroupInfo) GetActivatedExtList(d *Dice) []*ExtInfo {
 	var newList []*ExtInfo
 	activated := make(map[string]bool)
 	for _, item := range g.activatedExtList {
-		if item != nil && extMap[item.Name] != nil {
-			newList = append(newList, extMap[item.Name])
+		if item == nil || item.Name == "" {
+			continue
+		}
+		if live := extMap[item.Name]; live != nil {
+			newList = append(newList, live)
 			activated[item.Name] = true
+		} else {
+			// 未安装（已删除）的扩展：保留条目以维持群的开启状态，重装后自动恢复
+			newList = append(newList, item)
 		}
 	}
 
@@ -240,14 +273,26 @@ type groupInfoJSON struct {
 	ActivatedExtList []*ExtInfo `json:"activatedExtList"`
 }
 
+// groupInfoDecodeJSON 仅用于反序列化：activatedExtList 为私有字段，解码时自动跳过该键，
+// 由 GroupInfo.UnmarshalJSON 单独轻量解析，避免为每个群分配完整 ExtInfo 占位对象。
+type groupInfoDecodeJSON struct {
+	*groupInfoAlias
+}
+
+// extNameRefsJSON activatedExtList 的轻量解码结构，仅取出扩展名
+type extNameRefsJSON struct {
+	ActivatedExtList []struct {
+		Name string `json:"name"`
+	} `json:"activatedExtList"`
+}
+
 // MarshalJSON 自定义序列化，处理私有字段 activatedExtList
-// 同时过滤掉已删除的 wrapper（IsDeleted=true）
+// 已删除 wrapper（IsDeleted=true）的名字同样保留：群开启状态不因插件删除而丢失
 func (g *GroupInfo) MarshalJSON() ([]byte, error) {
 	g.extInitMu.Lock()
-	// 过滤掉已删除的 wrapper
 	var filteredList []*ExtInfo
 	for _, ext := range g.activatedExtList {
-		if ext != nil && !ext.IsDeleted {
+		if ext != nil {
 			filteredList = append(filteredList, ext)
 		}
 	}
@@ -260,15 +305,33 @@ func (g *GroupInfo) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON 自定义反序列化，处理私有字段 activatedExtList
+// 扩展名通过 extJSONResolver 直接解析为全局共享的 *ExtInfo 指针（见 loadGroups），
+// 未注册的扩展保留名字占位，由 GetActivatedExtList 决定去留
 func (g *GroupInfo) UnmarshalJSON(data []byte) error {
-	temp := &groupInfoJSON{
-		groupInfoAlias: (*groupInfoAlias)(g),
-	}
-	if err := json.Unmarshal(data, temp); err != nil {
+	if err := sonic.Unmarshal(data, &groupInfoDecodeJSON{groupInfoAlias: (*groupInfoAlias)(g)}); err != nil {
 		return err
 	}
+	var refs extNameRefsJSON
+	if err := sonic.Unmarshal(data, &refs); err != nil {
+		return err
+	}
+
+	var list []*ExtInfo
+	for _, ref := range refs.ActivatedExtList {
+		if ref.Name == "" {
+			continue
+		}
+		if extJSONResolver != nil {
+			if ext := extJSONResolver(ref.Name); ext != nil {
+				list = append(list, ext)
+				continue
+			}
+		}
+		list = append(list, extNamePlaceholder(ref.Name))
+	}
+
 	g.extInitMu.Lock()
-	g.activatedExtList = temp.ActivatedExtList
+	g.activatedExtList = list
 	g.extInitMu.Unlock()
 	return nil
 }
@@ -281,6 +344,55 @@ func (g *GroupInfo) MarkDirty(d *Dice) {
 	if d != nil && d.DirtyGroups != nil {
 		d.DirtyGroups.Store(g.GroupID, now)
 	}
+}
+
+type GroupLogState struct {
+	ID   uint64
+	Name string
+	On   bool
+}
+
+func (g *GroupInfo) ensureLogStateMu() *sync.RWMutex {
+	if g.logStateMu == nil {
+		g.logStateMu = &sync.RWMutex{}
+	}
+	return g.logStateMu
+}
+
+func (g *GroupInfo) GetLogState() GroupLogState {
+	mu := g.ensureLogStateMu()
+	mu.RLock()
+	defer mu.RUnlock()
+	return GroupLogState{
+		ID:   g.LogCurID,
+		Name: g.LogCurName,
+		On:   g.LogOn,
+	}
+}
+
+func (g *GroupInfo) SetLogState(logID uint64, logName string, logOn bool) {
+	mu := g.ensureLogStateMu()
+	mu.Lock()
+	g.LogCurID = logID
+	g.LogCurName = logName
+	g.LogOn = logOn
+	mu.Unlock()
+}
+
+func (g *GroupInfo) SetLogOn(logOn bool) {
+	mu := g.ensureLogStateMu()
+	mu.Lock()
+	g.LogOn = logOn
+	mu.Unlock()
+}
+
+func (g *GroupInfo) ClearLogState() {
+	mu := g.ensureLogStateMu()
+	mu.Lock()
+	g.LogCurID = 0
+	g.LogCurName = ""
+	g.LogOn = false
+	mu.Unlock()
 }
 
 func (group *GroupInfo) IsActive(ctx *MsgContext) bool {
@@ -602,6 +714,106 @@ type IMSession struct {
 	EndPoints    []*EndPointInfo                    `yaml:"endPoints"`
 	ServiceAtNew *SyncMap[string, *GroupInfo]       `json:"servicesAt" yaml:"-"`
 	PendingQuits *SyncMap[string, *PendingQuitInfo] `json:"-" yaml:"-"`
+
+	endPointsSnapshot      atomic.Pointer[[]*EndPointInfo]
+	groupMemberWelcomeMu   sync.Mutex
+	lastGroupMemberWelcome *LastWelcomeInfo
+}
+
+// EndPointDisplaySnapshot 是托盘菜单所需的端点展示值快照。
+// 它不包含适配器、会话、锁或通道，发布后不会随原端点对象继续变化。
+type EndPointDisplaySnapshot struct {
+	Nickname string
+	UserID   string
+	State    EndpointState
+}
+
+// RefreshEndPointsSnapshot 发布当前端点列表的只读快照。
+func (s *IMSession) RefreshEndPointsSnapshot() {
+	if s == nil {
+		return
+	}
+	snapshot := append([]*EndPointInfo(nil), s.EndPoints...)
+	s.endPointsSnapshot.Store(&snapshot)
+}
+
+// EndPointsSnapshot 返回最近发布列表中各端点展示字段的单次采样。
+// 端点状态由各适配器独立更新，因此该快照提供最终一致的托盘展示语义。
+func (s *IMSession) EndPointsSnapshot() []EndPointDisplaySnapshot {
+	if s == nil {
+		return nil
+	}
+	snapshot := s.endPointsSnapshot.Load()
+	if snapshot == nil {
+		return nil
+	}
+	display := make([]EndPointDisplaySnapshot, 0, len(*snapshot))
+	for _, endpoint := range *snapshot {
+		if endpoint == nil {
+			continue
+		}
+		display = append(display, EndPointDisplaySnapshot{
+			Nickname: endpoint.Nickname,
+			UserID:   endpoint.UserID,
+			State:    endpoint.State,
+		})
+	}
+	return display
+}
+
+func (s *IMSession) ResolveLiveEndpoint(ep *EndPointInfo) (*EndPointInfo, error) {
+	if ep == nil {
+		return nil, errors.New("endpoint is nil")
+	}
+	if s == nil {
+		return nil, errors.New("session is nil")
+	}
+
+	for _, cur := range s.EndPoints {
+		if cur == ep {
+			if cur.Session == nil {
+				cur.BindRuntime(s)
+			}
+			return cur, nil
+		}
+	}
+
+	if ep.ID != "" {
+		for _, cur := range s.EndPoints {
+			if cur != nil && cur.ID == ep.ID {
+				if cur.Session == nil {
+					cur.BindRuntime(s)
+				}
+				return cur, nil
+			}
+		}
+	}
+
+	var matched *EndPointInfo
+	for _, cur := range s.EndPoints {
+		if cur == nil {
+			continue
+		}
+		if cur.UserID != ep.UserID || cur.Platform != ep.Platform || cur.ProtocolType != ep.ProtocolType {
+			continue
+		}
+		if matched != nil && matched != cur {
+			return nil, fmt.Errorf("endpoint resolution ambiguous for userId=%s platform=%s protocolType=%s", ep.UserID, ep.Platform, ep.ProtocolType)
+		}
+		matched = cur
+	}
+	if matched != nil {
+		if matched.Session == nil {
+			matched.BindRuntime(s)
+		}
+		return matched, nil
+	}
+
+	if ep.Platform == "UI" && ep.Session == s {
+		return ep, nil
+	}
+
+	return nil, fmt.Errorf("endpoint not found: id=%s userId=%s platform=%s protocolType=%s", ep.ID, ep.UserID, ep.Platform, ep.ProtocolType)
 }
 
 type PendingQuitInfo struct {
@@ -674,10 +886,13 @@ type MsgContext struct {
 	SpamCheckedPerson   bool
 	UITestReplySplitLen *int
 
-	splitKeyMu sync.RWMutex
-	splitKey   string
-	vm         *ds.Context
-	_v1Rand    *rand2.PCGSource
+	splitKeyMu  sync.RWMutex
+	splitKey    string
+	vm          *ds.Context
+	_v1Rand     ds.DiceSource
+	diceRandSrc ds.DiceSource
+	chooserRand *randv2.Rand
+	chooserSrc  ds.DiceSource
 }
 
 // fillPrivilege 填写MsgContext中的权限字段, 并返回填写的权限等级
@@ -762,7 +977,7 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 				ep.Adapter.GetGroupInfoAsync(msg.GroupID)
 			}
 			log.Info(txt)
-			mctx.Notice(txt)
+			mctx.Notice(txt, NoticeTypeGroup)
 
 			if msg.Platform == "QQ" || msg.Platform == "TG" {
 				// ServiceAtNew changed
@@ -797,22 +1012,15 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 				tmpUID = msg.TmpUID
 			}
 			for _, i := range ats {
-				// 特殊处理 OpenQQ 和 OpenQQCH
 				if i.UserID == tmpUID {
 					amIBeMentioned = true
 					break
-				} else if strings.HasPrefix(i.UserID, "OpenQQ:") ||
-					strings.HasPrefix(i.UserID, "OpenQQCH:") {
-					uid := strings.TrimPrefix(tmpUID, "OpenQQ:")
-					if i.UserID == "OpenQQ:"+uid || i.UserID == "OpenQQCH:"+uid {
-						amIBeMentioned = true
-						break
-					}
 				}
 			}
 		}
 
 		mctx.Group, mctx.Player = GetPlayerInfoBySender(mctx, msg)
+		VarSetValueStr(mctx, "$tMsgID", fmt.Sprintf("%v", msg.RawID))
 		mctx.IsCurGroupBotOn = msg.MessageType == "group" && mctx.Group.IsActive(mctx)
 
 		if mctx.Group != nil && mctx.Group.System != "" {
@@ -873,14 +1081,16 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 		platformPrefix := msg.Platform
 		cmdArgs := CommandParse(msg.Message, cmdLst, d.CommandPrefix, platformPrefix, false)
 		if cmdArgs != nil {
+			cmdArgs.applyMentionedInfo(msg)
 			mctx.CommandID = getNextCommandID()
 
 			var tmpUID string
-			if platformPrefix == "OpenQQCH" {
+			switch platformPrefix {
+			case "OpenQQCH":
 				// 特殊处理 OpenQQ频道
 				uid := strings.TrimPrefix(ep.UserID, "OpenQQ:")
 				tmpUID = "OpenQQCH:" + uid
-			} else {
+			default:
 				tmpUID = ep.UserID
 			}
 			if msg.TmpUID != "" {
@@ -1007,7 +1217,7 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 					// 屏蔽机器人发送的消息
 					if mctx.MessageType == "group" {
 						// fmt.Println("YYYYYYYYY", myuid, mctx.Group != nil)
-						if mctx.Group.BotList.Exists(msg.Sender.UserID) {
+						if mctx.Group.IsBot(msg.Sender.UserID, msg.Sender.IsRobot) {
 							log.Infof("忽略指令(机器人): 来自群(%s)内<%s>(%s): %s", msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
 							return
 						}
@@ -1018,7 +1228,7 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 								// 忽略自己
 								continue
 							}
-							if mctx.Group.BotList.Exists(uid) {
+							if mctx.Group.IsBot(uid, i.IsRobot) {
 								return
 							}
 						}
@@ -1041,7 +1251,7 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 			// 试图匹配自定义回复
 			isSenderBot := false
 			if mctx.MessageType == "group" {
-				if mctx.Group != nil && mctx.Group.BotList.Exists(msg.Sender.UserID) {
+				if mctx.Group != nil && mctx.Group.IsBot(msg.Sender.UserID, msg.Sender.IsRobot) {
 					isSenderBot = true
 				}
 			}
@@ -1150,7 +1360,7 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 		// 疑似是为了获取群信息然后塞到奇怪的地方
 		// ep.Adapter.GetGroupInfoAsync(msg.GroupID)
 		log.Info(txt)
-		mctx.Notice(txt)
+		mctx.Notice(txt, NoticeTypeGroup)
 
 		if msg.Platform == "QQ" || msg.Platform == "TG" {
 			groupInfo, ok = mctx.Session.ServiceAtNew.Load(msg.GroupID)
@@ -1187,6 +1397,7 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 	}
 
 	mctx.Group, mctx.Player = GetPlayerInfoBySender(mctx, msg)
+	VarSetValueStr(mctx, "$tMsgID", fmt.Sprintf("%v", msg.RawID))
 	mctx.IsCurGroupBotOn = msg.MessageType == "group" && mctx.Group.IsActive(mctx)
 
 	if mctx.Group != nil && mctx.Group.System != "" {
@@ -1331,7 +1542,7 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 		// 试图匹配自定义回复
 		isSenderBot := false
 		if mctx.MessageType == "group" {
-			if mctx.Group != nil && mctx.Group.BotList.Exists(msg.Sender.UserID) {
+			if mctx.Group != nil && mctx.Group.IsBot(msg.Sender.UserID, msg.Sender.IsRobot) {
 				isSenderBot = true
 			}
 		}
@@ -1427,7 +1638,7 @@ func (s *IMSession) PreTriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *C
 		// 屏蔽机器人发送的消息
 		if mctx.MessageType == "group" {
 			// fmt.Println("YYYYYYYYY", myuid, mctx.Group != nil)
-			if mctx.Group.BotList.Exists(msg.Sender.UserID) {
+			if mctx.Group.IsBot(msg.Sender.UserID, msg.Sender.IsRobot) {
 				log.Infof("忽略指令(机器人): 来自群(%s)内<%s>(%s): %s", msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
 				return
 			}
@@ -1438,7 +1649,7 @@ func (s *IMSession) PreTriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *C
 					// 忽略自己
 					continue
 				}
-				if mctx.Group.BotList.Exists(uid) {
+				if mctx.Group.IsBot(uid, i.IsRobot) {
 					return
 				}
 			}
@@ -1455,7 +1666,7 @@ func (ep *EndPointInfo) TriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *
 	var ret bool
 	// 试图匹配自定义指令
 	if mctx.Group != nil && mctx.Group.IsActive(mctx) {
-		for _, wrapper := range mctx.Group.GetActivatedExtList(mctx.Dice) {
+		for _, wrapper := range commandExtensionOrder(mctx.Group, mctx.Dice) {
 			ext := wrapper.GetRealExt()
 			if ext == nil {
 				continue
@@ -1535,7 +1746,7 @@ func (s *IMSession) OnGroupJoined(ctx *MsgContext, msg *Message) {
 	}()
 	txt := fmt.Sprintf("加入群组: <%s>(%s)", groupName, msg.GroupID)
 	log.Info(txt)
-	ctx.Notice(txt)
+	ctx.Notice(txt, NoticeTypeGroup)
 	for _, wrapper := range group.GetActivatedExtList(ctx.Dice) {
 		ext := wrapper.GetRealExt()
 		if ext == nil {
@@ -1549,54 +1760,74 @@ func (s *IMSession) OnGroupJoined(ctx *MsgContext, msg *Message) {
 	}
 }
 
-var lastWelcome *LastWelcomeInfo
+func (s *IMSession) isDuplicateGroupMemberWelcome(msg *Message) bool {
+	s.groupMemberWelcomeMu.Lock()
+	defer s.groupMemberWelcomeMu.Unlock()
+
+	last := s.lastGroupMemberWelcome
+	isDuplicate := last != nil &&
+		msg.GroupID == last.GroupID &&
+		msg.Sender.UserID == last.UserID &&
+		msg.Time == last.Time
+	s.lastGroupMemberWelcome = &LastWelcomeInfo{
+		GroupID: msg.GroupID,
+		UserID:  msg.Sender.UserID,
+		Time:    msg.Time,
+	}
+	return isDuplicate
+}
 
 // OnGroupMemberJoined 群成员进群事件处理，除了 bot 自己以外的群成员入群时调用。其他 Adapter 应当尽快迁移至此方法实现
 func (s *IMSession) OnGroupMemberJoined(ctx *MsgContext, msg *Message) {
 	log := s.Parent.Logger
 
 	groupInfo, ok := s.ServiceAtNew.Load(msg.GroupID)
+	needWelcome := false
+	reason := "group_not_loaded"
+	if ok {
+		if groupInfo.ShowGroupWelcome {
+			needWelcome = true
+			reason = "welcome_enabled"
+		} else {
+			reason = "welcome_disabled"
+		}
+	}
+	if !needWelcome {
+		log.Infof("检查是否需要迎新: need_welcome=%t reason=%s group_id=%s user_id=%s", needWelcome, reason, msg.GroupID, msg.Sender.UserID)
+		return
+	}
+
 	// 进群的是别人，是否迎新？
 	// 这里很诡异，当手机QQ客户端审批进群时，入群后会有一句默认发言
 	// 此时会收到两次完全一样的某用户入群信息，导致发两次欢迎词
-	if ok && groupInfo.ShowGroupWelcome {
-		isDouble := false
-		if lastWelcome != nil {
-			isDouble = msg.GroupID == lastWelcome.GroupID &&
-				msg.Sender.UserID == lastWelcome.UserID &&
-				msg.Time == lastWelcome.Time
-		}
-		lastWelcome = &LastWelcomeInfo{
-			GroupID: msg.GroupID,
-			UserID:  msg.Sender.UserID,
-			Time:    msg.Time,
-		}
-
-		if !isDouble {
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						log.Errorf("迎新致辞异常: %v 堆栈: %v", r, string(debug.Stack()))
-					}
-				}()
-
-				// Ensure context has group set for formatting and attrs access
-				ctx.Group, ctx.Player = GetPlayerInfoBySender(ctx, msg)
-				// VarSetValueStr(ctx, "$t新人昵称", "<"+msgQQ.Sender.Nickname+">")
-				uidRaw := UserIDExtract(msg.Sender.UserID)
-				VarSetValueStr(ctx, "$t帐号ID_RAW", uidRaw)
-				VarSetValueStr(ctx, "$t账号ID_RAW", uidRaw)
-				stdID := msg.Sender.UserID
-				VarSetValueStr(ctx, "$t帐号ID", stdID)
-				VarSetValueStr(ctx, "$t账号ID", stdID)
-				text := DiceFormat(ctx, groupInfo.GroupWelcomeMessage)
-				for _, i := range ctx.SplitText(text) {
-					doSleepQQ(ctx)
-					ReplyGroup(ctx, msg, strings.TrimSpace(i))
-				}
-			}()
-		}
+	if s.isDuplicateGroupMemberWelcome(msg) {
+		log.Infof("检查是否需要迎新: need_welcome=false reason=duplicate_event group_id=%s user_id=%s", msg.GroupID, msg.Sender.UserID)
+		return
 	}
+
+	log.Infof("检查是否需要迎新: need_welcome=true reason=%s group_id=%s user_id=%s", reason, msg.GroupID, msg.Sender.UserID)
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Errorf("迎新致辞异常: %v 堆栈: %v", r, string(debug.Stack()))
+			}
+		}()
+
+		// Ensure context has group set for formatting and attrs access
+		ctx.Group, ctx.Player = GetPlayerInfoBySender(ctx, msg)
+		uidRaw := UserIDExtract(msg.Sender.UserID)
+		VarSetValueStr(ctx, "$t帐号ID_RAW", uidRaw)
+		VarSetValueStr(ctx, "$t账号ID_RAW", uidRaw)
+		stdID := msg.Sender.UserID
+		VarSetValueStr(ctx, "$t帐号ID", stdID)
+		VarSetValueStr(ctx, "$t账号ID", stdID)
+		text := DiceFormat(ctx, groupInfo.GroupWelcomeMessage)
+		log.Infof("发送迎新消息: group_id=%s user_id=%s text=%q", msg.GroupID, msg.Sender.UserID, text)
+		for _, i := range ctx.SplitText(text) {
+			doSleepQQ(ctx)
+			ReplyGroup(ctx, msg, strings.TrimSpace(i))
+		}
+	}()
 }
 
 var platformRE = regexp.MustCompile(`^(.*)-Group:`)
@@ -1712,7 +1943,7 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 	var noticeCtx *MsgContext
 	if summaryMode {
 		noticeCtx = &MsgContext{EndPoint: selectedGroupEndpoints[0].Endpoint, Session: s, Dice: s.Parent}
-		noticeCtx.Notice(fmt.Sprintf("自动退群任务开始：本轮预计处理 %d 个群。", len(selectedGroupEndpoints)))
+		noticeCtx.Notice(fmt.Sprintf("自动退群任务开始：本轮预计处理 %d 个群。", len(selectedGroupEndpoints)), NoticeTypeInactive)
 	}
 
 	go func() {
@@ -1762,7 +1993,7 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 			ep.Adapter.QuitGroup(msgCtx, grp.GroupID)
 			quitStarted++
 			if !summaryMode {
-				msgCtx.Notice(hint)
+				msgCtx.Notice(hint, NoticeTypeInactive)
 			}
 			// 生成一个随机值（8~11秒随机）
 			randomSleep := time.Duration(rand.Intn(3000)+8000) * time.Millisecond
@@ -1770,7 +2001,7 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 			time.Sleep(randomSleep)
 		}
 		if summaryMode && noticeCtx != nil {
-			noticeCtx.Notice(fmt.Sprintf("自动退群任务结束：候选 %d 个，开始处理 %d 个，已发起退群 %d 个，跳过 %d 个，取消 %d 个。", len(selectedGroupEndpoints), processed, quitStarted, skipped, cancelled))
+			noticeCtx.Notice(fmt.Sprintf("自动退群任务结束：候选 %d 个，开始处理 %d 个，已发起退群 %d 个，跳过 %d 个，取消 %d 个。", len(selectedGroupEndpoints), processed, quitStarted, skipped, cancelled), NoticeTypeInactive)
 		}
 	}()
 }
@@ -1822,7 +2053,7 @@ func isBlacklistedHelpMasterRequest(cmdArgs *CmdArgs) bool {
 	return len(cmdArgs.Args) == 1 && cmdArgs.IsArgEqual(1, "骰主")
 }
 
-func handleBlacklistedUserQuitIfAdmin(ctx *MsgContext, msg *Message, isWhiteGroup bool, banQuitGroup func()) bool {
+func handleBlacklistedUserQuitIfAdmin(ctx *MsgContext, msg *Message, isWhiteGroup bool, now time.Time, banQuitGroup func()) bool {
 	d := ctx.Dice
 	log := d.Logger
 	banListInfoItem, _ := d.Config.BanList.GetByID(msg.Sender.UserID)
@@ -1840,7 +2071,7 @@ func handleBlacklistedUserQuitIfAdmin(ctx *MsgContext, msg *Message, isWhiteGrou
 
 		noticeMsg := fmt.Sprintf("检测到群(%s)内黑名单用户<%s>(%s)，因是管理以上权限，执行通告后自动退群\n%s", groupID, msg.Sender.Nickname, msg.Sender.UserID, reasontext)
 		log.Info(noticeMsg)
-		ctx.Notice(noticeMsg)
+		ctx.Notice(noticeMsg, NoticeTypeBan)
 		banQuitGroup()
 		return true
 	}
@@ -1851,13 +2082,17 @@ func handleBlacklistedUserQuitIfAdmin(ctx *MsgContext, msg *Message, isWhiteGrou
 	}
 
 	if d.Config.BanList.BanBehaviorQuitIfAdmin {
+		if !d.Config.BanList.CanNotifyBlacklistedUser(groupID, msg.Sender.UserID, now) {
+			return true
+		}
+
 		noticeMsg := fmt.Sprintf("检测到群(%s)内黑名单用户<%s>(%s)，因是普通群员，进行群内通告\n%s", groupID, msg.Sender.Nickname, msg.Sender.UserID, reasontext)
 		log.Info(noticeMsg)
 
-		text := fmt.Sprintf("警告: <%s>(%s)是黑名单用户，将对骰主进行通知。", msg.Sender.Nickname, msg.Sender.UserID)
+		text := fmt.Sprintf("警告: <%s>(%s)是黑名单用户，将对骰主进行通知。\n%s", msg.Sender.Nickname, msg.Sender.UserID, reasontext)
 		ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
 
-		ctx.Notice(noticeMsg)
+		ctx.Notice(noticeMsg, NoticeTypeBan)
 		return true
 	}
 
@@ -1871,7 +2106,7 @@ func handleBlacklistedUser(ctx *MsgContext, msg *Message, isWhiteGroup bool, now
 	log := d.Logger
 
 	if (d.Config.BanList.BanBehaviorQuitIfAdmin || d.Config.BanList.BanBehaviorQuitIfAdminSilentIfNotAdmin) && msg.MessageType == "group" {
-		return handleBlacklistedUserQuitIfAdmin(ctx, msg, isWhiteGroup, banQuitGroup)
+		return handleBlacklistedUserQuitIfAdmin(ctx, msg, isWhiteGroup, now, banQuitGroup)
 	}
 
 	if d.Config.BanList.BanBehaviorQuitPlaceImmediately && msg.MessageType == "group" {
@@ -1924,7 +2159,7 @@ func checkBan(ctx *MsgContext, msg *Message) (notReply bool) {
 		text := fmt.Sprintf("因<%s>(%s)是黑名单用户，将自动退群。", msg.Sender.Nickname, msg.Sender.UserID)
 		ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
 
-		ctx.Notice(noticeMsg)
+		ctx.Notice(noticeMsg, NoticeTypeBan)
 
 		time.Sleep(1 * time.Second)
 		ctx.EndPoint.Adapter.QuitGroup(ctx, groupID)
@@ -1948,7 +2183,7 @@ func checkBan(ctx *MsgContext, msg *Message) (notReply bool) {
 
 				ReplyGroupRaw(ctx, &Message{GroupID: groupID}, "因本群处于黑名单中，将自动退群。", "")
 
-				ctx.Notice(noticeMsg)
+				ctx.Notice(noticeMsg, NoticeTypeBan)
 
 				time.Sleep(1 * time.Second)
 				ctx.EndPoint.Adapter.QuitGroup(ctx, groupID)
@@ -2018,15 +2253,8 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 				// 允许代骰时，发一句话
 				cur := -1
 				for index, i := range cmdArgs.At {
-					if i.UserID == ctx.EndPoint.UserID {
+					if i.UserID == ctx.EndPoint.UserID || (cmdArgs.uidForAtInfo != "" && i.UserID == cmdArgs.uidForAtInfo) {
 						continue
-					} else if strings.HasPrefix(ctx.EndPoint.UserID, "OpenQQ:") {
-						// 特殊处理 OpenQQ频道
-						uid := strings.TrimPrefix(i.UserID, "OpenQQCH:")
-						diceId := strings.TrimPrefix(ctx.EndPoint.UserID, "OpenQQ:")
-						if uid == diceId {
-							continue
-						}
 					}
 					cur = index
 				}
@@ -2114,7 +2342,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		}
 
 		if group != nil && (group.Active || ctx.IsCurGroupBotOn) {
-			for _, wrapper := range group.GetActivatedExtList(ctx.Dice) {
+			for _, wrapper := range commandExtensionOrder(group, ctx.Dice) {
 				cmdMap := wrapper.GetCmdMap()
 				item := cmdMap[cmdArgs.Command]
 				if tryItemSolve(wrapper, item) {
@@ -2162,6 +2390,13 @@ func (s *IMSession) OnMessageDeleted(mctx *MsgContext, msg *Message) {
 	}
 
 	_ = mctx.fillPrivilege(msg)
+
+	log := d.Logger
+	if msg.MessageType == "group" {
+		log.Infof("收到群(%s)内<%s>(%s)的撤回消息事件: rawId=%v", msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, msg.RawID)
+	} else {
+		log.Infof("收到<%s>(%s)的撤回消息事件: rawId=%v", msg.Sender.Nickname, msg.Sender.UserID, msg.RawID)
+	}
 
 	for _, i := range s.Parent.ExtList {
 		i.CallOnMessageDeleted(mctx.Dice, mctx, msg)
@@ -2266,79 +2501,76 @@ func (ep *EndPointInfo) SetEnable(_ *Dice, enable bool) {
 	}
 }
 
-func (ep *EndPointInfo) AdapterSetup() {
+func (ep *EndPointInfo) BindRuntime(session *IMSession) {
+	if ep == nil {
+		return
+	}
+	ep.Session = session
+
+	if ep.Adapter == nil {
+		return
+	}
+
 	switch ep.Platform {
 	case "QQ":
 		switch ep.ProtocolType {
 		case "onebot":
 			pa := ep.Adapter.(*PlatformAdapterGocq)
-			pa.Session = ep.Session
 			pa.EndPoint = ep
 		case "walle-q":
 			pa := ep.Adapter.(*PlatformAdapterWalleQ)
-			pa.Session = ep.Session
 			pa.EndPoint = ep
 		case "red":
 			pa := ep.Adapter.(*PlatformAdapterRed)
-			pa.Session = ep.Session
 			pa.EndPoint = ep
 		case "official":
 			pa := ep.Adapter.(*PlatformAdapterOfficialQQ)
-			pa.Session = ep.Session
 			pa.EndPoint = ep
 		case "satori":
 			pa := ep.Adapter.(*PlatformAdapterSatori)
-			pa.Session = ep.Session
 			pa.EndPoint = ep
 		case "milky":
 			pa := ep.Adapter.(*PlatformAdapterMilky)
-			pa.Session = ep.Session
 			pa.EndPoint = ep
 		case "pureonebot":
 			pa := ep.Adapter.(*PlatformAdapterOnebot)
 			log := zap.S().Named(logger.LogKeyAdapter)
-			pa.Session = ep.Session
 			pa.EndPoint = ep
 			pa.logger = log
 			pa.desiredEnabled = ep.Enable
 			// case "LagrangeGo":
 			//	pa := ep.Adapter.(*PlatformAdapterLagrangeGo)
-			//	pa.Session = ep.Session
 			//	pa.EndPoint = ep
 		}
 	case "DISCORD":
 		pa := ep.Adapter.(*PlatformAdapterDiscord)
-		pa.Session = ep.Session
 		pa.EndPoint = ep
 	case "KOOK":
 		pa := ep.Adapter.(*PlatformAdapterKook)
-		pa.Session = ep.Session
 		pa.EndPoint = ep
 	case "TG":
 		pa := ep.Adapter.(*PlatformAdapterTelegram)
-		pa.Session = ep.Session
 		pa.EndPoint = ep
 	case "MC":
 		pa := ep.Adapter.(*PlatformAdapterMinecraft)
-		pa.Session = ep.Session
 		pa.EndPoint = ep
 	case "DODO":
 		pa := ep.Adapter.(*PlatformAdapterDodo)
-		pa.Session = ep.Session
 		pa.EndPoint = ep
 	case "DINGTALK":
 		pa := ep.Adapter.(*PlatformAdapterDingTalk)
-		pa.Session = ep.Session
 		pa.EndPoint = ep
 	case "SLACK":
 		pa := ep.Adapter.(*PlatformAdapterSlack)
-		pa.Session = ep.Session
 		pa.EndPoint = ep
 	case "SEALCHAT":
 		pa := ep.Adapter.(*PlatformAdapterSealChat)
-		pa.Session = ep.Session
 		pa.EndPoint = ep
 	}
+}
+
+func (ep *EndPointInfo) AdapterSetup() {
+	ep.BindRuntime(ep.Session)
 }
 
 func (ep *EndPointInfo) RefreshGroupNum() {
@@ -2366,11 +2598,87 @@ func (ep *EndPointInfo) RefreshGroupNum() {
 	}
 }
 
-func (d *Dice) NoticeForEveryEndpoint(txt string, allowCrossPlatform bool) {
+func sendNoticeToTarget(ctx *MsgContext, target NoticeTarget, txt string) {
+	if target.IsGroup() {
+		ReplyGroup(ctx, &Message{GroupID: target.ID}, txt)
+	} else {
+		ReplyPerson(ctx, &Message{Sender: SenderBase{UserID: target.ID}}, txt)
+	}
+}
+
+func noticeTargetMatchesEndpoint(target NoticeTarget, ep *EndPointInfo) bool {
+	if ep == nil || !target.MatchesEndpoint(ep.Platform, ep.ProtocolType) {
+		return false
+	}
+
+	targetPlatform, _ := target.Platform()
+	if targetPlatform != "OpenQQ" {
+		return true
+	}
+
+	// 多个官方 QQ 账号共存时，只让 ID 中 UIN 对应的账号发送。
+	pa, ok := ep.Adapter.(*PlatformAdapterOfficialQQ)
+	if !ok || pa.UIN == "" {
+		return false
+	}
+	_, rawID, ok := strings.Cut(target.ID, ":")
+	return ok && (rawID == pa.UIN || strings.HasPrefix(rawID, pa.UIN+"-"))
+}
+
+func noticeTargetContext(session *IMSession, ep *EndPointInfo, target NoticeTarget) *MsgContext {
+	if ep.Session == nil {
+		ep.BindRuntime(session)
+	}
+
+	msg := &Message{Sender: SenderBase{UserID: target.ID}, MessageType: "private"}
+	if target.IsGroup() {
+		msg.MessageType = "group"
+		msg.GroupID = target.ID
+	}
+	return CreateTempCtx(ep, msg)
+}
+
+func findNoticeEndpoint(session *IMSession, target NoticeTarget) *EndPointInfo {
+	if session == nil {
+		return nil
+	}
+	for _, ep := range session.EndPoints {
+		if ep != nil && ep.Enable && ep.State == StateConnected && noticeTargetMatchesEndpoint(target, ep) {
+			return ep
+		}
+	}
+	return nil
+}
+
+// sendNoticeTargetCrossPlatform 优先使用当前 Endpoint，否则寻找兼容且在线的 Endpoint。
+func sendNoticeTargetCrossPlatform(ctx *MsgContext, target NoticeTarget, txt string) bool {
+	if ctx == nil {
+		return false
+	}
+	if ctx.EndPoint != nil && ctx.EndPoint.Enable && noticeTargetMatchesEndpoint(target, ctx.EndPoint) {
+		sendNoticeToTarget(ctx, target, txt)
+		return true
+	}
+
+	session := ctx.Session
+	if session == nil && ctx.Dice != nil {
+		session = ctx.Dice.ImSession
+	}
+	ep := findNoticeEndpoint(session, target)
+	if ep == nil {
+		return false
+	}
+	sendNoticeToTarget(noticeTargetContext(session, ep, target), target, txt)
+	return true
+}
+
+// NoticeForEveryEndpoint 向每个平台的在线账号发送一遍指定分类的通知。
+func (d *Dice) NoticeForEveryEndpoint(txt string, allowCrossPlatform bool, noticeTypes ...NoticeType) {
 	_ = allowCrossPlatform
-	// 通知种类之一：每个noticeId  *  每个平台匹配的ep：存活
-	// TODO: 先复制几次实现，后面重构
-	// Pinenutn: 啥时候重构啊.jpg
+	noticeType := NoticeTypeSystem
+	if len(noticeTypes) > 0 {
+		noticeType = noticeTypes[0]
+	}
 	foo := func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -2379,99 +2687,35 @@ func (d *Dice) NoticeForEveryEndpoint(txt string, allowCrossPlatform bool) {
 		}()
 
 		if d.Config.MailEnable {
-			_ = d.SendMail(txt, MailTypeNotice)
+			if err := d.SendMail(txt, MailTypeNotice, noticeType); err != nil {
+				d.Logger.Errorf("邮件通知发送失败: %v", err)
+			}
 			return
 		}
 
 		for _, ep := range d.ImSession.EndPoints {
-			for _, i := range d.Config.NoticeIDs {
-				n := strings.Split(i, ":")
-				// 如果文本中没有-，则会取到整个字符串
-				// 但好像不严谨，比如QQ-CH-Group
-				prefix := strings.Split(n[0], "-")[0]
-
-				if len(n) >= 2 && prefix == ep.Platform && ep.Enable && ep.State == 1 {
-					if ep.Session == nil {
-						ep.Session = d.ImSession
-					}
-					if strings.HasSuffix(n[0], "-Group") {
-						msg := &Message{GroupID: i, MessageType: "private", Sender: SenderBase{UserID: i}}
-						ctx := CreateTempCtx(ep, msg)
-						ReplyGroup(ctx, msg, txt)
-					} else {
-						msg := &Message{GroupID: i, MessageType: "group", Sender: SenderBase{UserID: i}}
-						ctx := CreateTempCtx(ep, msg)
-						ReplyPerson(ctx, &Message{Sender: SenderBase{UserID: i}}, txt)
-					}
-				}
-				time.Sleep(1 * time.Second)
-			}
-		}
-	}
-	go foo()
-}
-
-func (ctx *MsgContext) NoticeCrossPlatform(txt string) {
-	// 通知种类之二：每个noticeID  *  第一个平台匹配的ep：跨平台通知
-	// TODO: 先复制几次实现，后面重构
-	foo := func() {
-		defer func() {
-			if r := recover(); r != nil {
-				ctx.Dice.Logger.Errorf("发送通知异常: %v 堆栈: %v", r, string(debug.Stack()))
-			}
-		}()
-
-		if ctx.Dice.Config.MailEnable {
-			_ = ctx.Dice.SendMail(txt, MailTypeNotice)
-			return
-		}
-
-		sent := false
-
-		for _, i := range ctx.Dice.Config.NoticeIDs {
-			n := strings.Split(i, ":")
-			if len(n) < 2 {
+			if ep == nil || !ep.Enable || ep.State != StateConnected {
 				continue
 			}
-
-			seg := strings.Split(n[0], "-")[0]
-
-			messageType := "private"
-			if strings.HasSuffix(n[0], "-Group") {
-				messageType = "group"
-			}
-
-			if ctx.EndPoint.Platform == seg {
-				if messageType == "group" {
-					ReplyGroup(ctx, &Message{GroupID: i}, txt)
-				} else {
-					ReplyPerson(ctx, &Message{Sender: SenderBase{UserID: i}}, txt)
+			for _, target := range filterNoticeTargets(d.Config.NoticeIDs, noticeType) {
+				if !noticeTargetMatchesEndpoint(target, ep) {
+					continue
 				}
-				time.Sleep(1 * time.Second)
-				sent = true
-				continue // 找到对应平台、调用了发送的在此即切出循环
+				ctx := noticeTargetContext(d.ImSession, ep, target)
+				sendNoticeToTarget(ctx, target, txt)
+				time.Sleep(time.Second)
 			}
-
-			// 如果走到这里，说明当前ep不是noticeID对应的平台
-			if done := CrossMsgBySearch(ctx.Session, seg, i, txt, messageType == "private"); !done {
-				ctx.Dice.Logger.Errorf("尝试跨平台后仍未能向 %s 发送通知：%s", i, txt)
-			} else {
-				sent = true
-				time.Sleep(1 * time.Second)
-			}
-		}
-
-		if !sent {
-			ctx.Dice.Logger.Errorf("未能发送来自%s的通知：%s", ctx.EndPoint.Platform, txt)
 		}
 	}
 	go foo()
 }
 
-func (ctx *MsgContext) Notice(txt string) {
-	// Notice
-	// 通知种类之三：每个noticeID  * 当前mctx的ep：不跨平台通知
-	// TODO: 先复制几次实现，后面重构
+// NoticeCrossPlatform 优先用当前账号发送，并为其他平台寻找第一个启用账号。
+func (ctx *MsgContext) NoticeCrossPlatform(txt string, noticeTypes ...NoticeType) {
+	noticeType := NoticeTypeSystem
+	if len(noticeTypes) > 0 {
+		noticeType = noticeTypes[0]
+	}
 	foo := func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -2480,31 +2724,74 @@ func (ctx *MsgContext) Notice(txt string) {
 		}()
 
 		if ctx.Dice.Config.MailEnable {
-			_ = ctx.Dice.SendMail(txt, MailTypeNotice)
+			if err := ctx.Dice.SendMail(txt, MailTypeNotice, noticeType); err != nil {
+				ctx.Dice.Logger.Errorf("邮件通知发送失败: %v", err)
+			}
 			return
 		}
 
 		sent := false
-		if ctx.EndPoint.Enable {
-			for _, i := range ctx.Dice.Config.NoticeIDs {
-				n := strings.Split(i, ":")
-				if len(n) >= 2 {
-					if strings.HasSuffix(n[0], "-Group") {
-						ReplyGroup(ctx, &Message{GroupID: i}, txt)
-					} else {
-						ReplyPerson(ctx, &Message{Sender: SenderBase{UserID: i}}, txt)
-					}
-					sent = true
-				}
-				time.Sleep(1 * time.Second)
+		for _, target := range filterNoticeTargets(ctx.Dice.Config.NoticeIDs, noticeType) {
+			if !sendNoticeTargetCrossPlatform(ctx, target, txt) {
+				ctx.Dice.Logger.Errorf("尝试跨平台后仍未能向 %s 发送通知：%s", target.ID, txt)
+			} else {
+				sent = true
+				time.Sleep(time.Second)
 			}
 		}
 
 		if !sent {
-			if len(ctx.Dice.Config.NoticeIDs) != 0 {
-				ctx.Dice.Logger.Errorf("未能发送来自%s的通知：%s", ctx.EndPoint.Platform, txt)
+			platform := "<未知平台>"
+			if ctx.EndPoint != nil {
+				platform = ctx.EndPoint.Platform
+			}
+			ctx.Dice.Logger.Errorf("未能发送来自%s的通知：%s", platform, txt)
+		}
+	}
+	go foo()
+}
+
+// Notice 使用当前消息上下文的账号发送指定分类通知。
+func (ctx *MsgContext) Notice(txt string, noticeTypes ...NoticeType) {
+	noticeType := NoticeTypeSystem
+	if len(noticeTypes) > 0 {
+		noticeType = noticeTypes[0]
+	}
+	foo := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ctx.Dice.Logger.Errorf("发送通知异常: %v 堆栈: %v", r, string(debug.Stack()))
+			}
+		}()
+
+		if ctx.Dice.Config.MailEnable {
+			if err := ctx.Dice.SendMail(txt, MailTypeNotice, noticeType); err != nil {
+				ctx.Dice.Logger.Errorf("邮件通知发送失败: %v", err)
+			}
+			return
+		}
+
+		sent := false
+		if ctx.EndPoint != nil && ctx.EndPoint.Enable {
+			for _, target := range filterNoticeTargets(ctx.Dice.Config.NoticeIDs, noticeType) {
+				if !noticeTargetMatchesEndpoint(target, ctx.EndPoint) {
+					continue
+				}
+				sendNoticeToTarget(ctx, target, txt)
+				sent = true
+				time.Sleep(time.Second)
+			}
+		}
+
+		if !sent {
+			platform := "<未知平台>"
+			if ctx.EndPoint != nil {
+				platform = ctx.EndPoint.Platform
+			}
+			if len(filterNoticeTargets(ctx.Dice.Config.NoticeIDs, noticeType)) != 0 {
+				ctx.Dice.Logger.Errorf("未能发送来自%s的通知：%s", platform, txt)
 			} else {
-				ctx.Dice.Logger.Warnf("因为没有配置通知列表，无法发送来自%s的通知：%s", ctx.EndPoint.Platform, txt)
+				ctx.Dice.Logger.Warnf("因为没有启用接收 %s 分类的通知目标，无法发送来自%s的通知：%s", noticeType, platform, txt)
 			}
 		}
 	}
@@ -2579,6 +2866,9 @@ func (ctx *MsgContext) ShallowCopy() *MsgContext {
 		UITestReplySplitLen: ctx.UITestReplySplitLen,
 		vm:                  ctx.vm,
 		_v1Rand:             ctx._v1Rand,
+		diceRandSrc:         ctx.diceRandSrc,
+		chooserRand:         ctx.chooserRand,
+		chooserSrc:          ctx.chooserSrc,
 	}
 	copyCtx.SetSplitKey(ctx.getSplitKey())
 	return copyCtx

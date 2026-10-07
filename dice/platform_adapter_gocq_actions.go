@@ -446,7 +446,7 @@ func (pa *PlatformAdapterGocq) SendFileToPerson(ctx *MsgContext, userID string, 
 		return
 	}
 
-	dice := pa.Session.Parent
+	dice := pa.EndPoint.Session.Parent
 	// 路径可以是 http/base64/本地路径，但 gocq 的文件上传只支持本地文件，所以临时下载到本地
 	fileName, temp, err := message.ExtractLocalTempFile(path)
 
@@ -488,7 +488,7 @@ func (pa *PlatformAdapterGocq) SendFileToGroup(ctx *MsgContext, groupID string, 
 		return
 	}
 
-	dice := pa.Session.Parent
+	dice := pa.EndPoint.Session.Parent
 	// 路径可以是 http/base64/本地路径，但 gocq 的文件上传只支持本地文件，所以临时下载到本地
 	fileName, temp, err := message.ExtractLocalTempFile(path)
 
@@ -584,6 +584,10 @@ func (pa *PlatformAdapterGocq) waitEcho2(echo any, value interface{}, beforeWait
 
 // GetGroupMemberInfo 获取群成员信息
 func (pa *PlatformAdapterGocq) GetGroupMemberInfo(groupID string, userID string) *OnebotUserInfo {
+	return pa.getGroupMemberInfo(groupID, userID, false)
+}
+
+func (pa *PlatformAdapterGocq) getGroupMemberInfo(groupID string, userID string, noCache bool) *OnebotUserInfo {
 	type DetailParams struct {
 		GroupID string `json:"group_id"`
 		UserID  string `json:"user_id"`
@@ -597,7 +601,7 @@ func (pa *PlatformAdapterGocq) GetGroupMemberInfo(groupID string, userID string)
 		Params: DetailParams{
 			GroupID: groupID,
 			UserID:  userID,
-			NoCache: false,
+			NoCache: noCache,
 		},
 		Echo: echo,
 	})

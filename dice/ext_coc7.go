@@ -306,6 +306,9 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 				text = DiceFormatTmpl(mctx, "COC:检定")
 			}
 
+			// 命运流向: 期望被偏移时追加提示
+			text += FateRollHint(mctx)
+
 			isHide := cmdArgs.Command == "rah" || cmdArgs.Command == "rch"
 
 			// 指令信息
@@ -1302,6 +1305,8 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 			ctx.CommandInfo = commandInfo
 
 			text := DiceFormatTmpl(mctx, "COC:理智检定")
+			// 命运流向: 期望被偏移时追加提示
+			text += FateRollHint(mctx)
 			if kw := cmdArgs.GetKwarg("ci"); kw != nil {
 				info, err := json.Marshal(ctx.CommandInfo)
 				if err == nil {

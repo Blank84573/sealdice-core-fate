@@ -654,19 +654,24 @@ func deckDraw(ctx *MsgContext, deckName string, shufflePool bool) (bool, string,
 
 func RegisterBuiltinExtDeck(d *Dice) {
 	helpDraw := "" +
-		".draw help // 显示本帮助\n" +
-		".draw keys // 查看可抽取的牌组列表\n" +
-		".draw keys <牌堆> // 查看特定牌堆可抽取的牌组列表\n" +
-		".draw search <牌组名称> // 搜索相关牌组\n" +
-		".draw reload // 从硬盘重新装载牌堆，仅Master可用\n" +
-		".draw list // 查看载入的牌堆文件\n" +
-		".draw <牌组名称> // 进行抽牌"
+		"■ 命运之匣 · 签筒\n" +
+		"｜命运的签文，自匣中抽取＼＼＼\n" +
+		"——————————\n" +
+		"｜.draw help // 显示本帮助\n" +
+		"｜.draw keys // 查看可抽取的牌组列表\n" +
+		"｜.draw keys <牌堆> // 查看特定牌堆的牌组\n" +
+		"｜.draw search <牌组名称> // 搜索相关牌组\n" +
+		"｜.draw reload // 重新装载牌堆（仅骰主）\n" +
+		"｜.draw list // 查看载入的牌堆文件\n" +
+		"｜.draw <牌组名称> // 进行抽牌\n" +
+		"——————————\n" +
+		"「签筒已摇响，且看命运予你何物」"
 
 	cmdDraw := &CmdItemInfo{
 		EnableExecuteTimesParse: true,
 		Name:                    "draw",
 		ShortHelp:               helpDraw,
-		Help:                    "抽牌命令: \n" + helpDraw,
+		Help:                helpDraw,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			if d.IsDeckLoading {
 				ReplyToSender(ctx, msg, "牌堆尚未就绪，可能正在重新装载")

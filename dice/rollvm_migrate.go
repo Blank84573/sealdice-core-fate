@@ -28,6 +28,9 @@ func (ctx *MsgContext) GenDefaultRollVmConfig() *ds.RollConfig {
 	config.OpCountLimit = 30000
 	config.ParseExprLimit = 10000000 // kenichiLyon: 限制解析算力，防止递归过深，这里以建议值1000万设置。
 
+	// 命运流向: 根据群/个人模式设置骰子期望偏移(0=均衡不偏移)
+	config.FateExpectation = GetFateExpectation(ctx)
+
 	am := ctx.Dice.AttrsManager
 	config.HookValueStore = func(vm *ds.Context, name string, v *ds.VMValue) (overwrite *ds.VMValue, solved bool) {
 		// 临时变量

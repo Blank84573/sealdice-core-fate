@@ -306,7 +306,7 @@ func (d *Dice) registerCoreCommands() {
 	cmdBlack := &CmdItemInfo{
 		Name:      "ban",
 		ShortHelp: helpForBlack,
-		Help:      "黑名单指令:\n" + helpForBlack,
+		Help:      "■ 命运之匣 · 黜逐\n｜将不容者逐出匣外＼\n————\n" + helpForBlack,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			cmdArgs.ChopPrefixToArgsWith("add", "rm", "del", "list", "show", "find", "trust")
 			if ctx.PrivilegeLevel < 100 {
@@ -450,7 +450,7 @@ func (d *Dice) registerCoreCommands() {
 	cmdFind := &CmdItemInfo{
 		Name:      "find",
 		ShortHelp: helpForFind,
-		Help:      "查询指令，通常使用全文搜索(x86版)或快速查询(arm, 移动版):\n" + helpForFind,
+		Help:      "■ 命运之匣 · 探寻\n｜于浩瀚典籍中检索＼\n————————\n" + helpForFind,
 		// 写不下了
 		// + "\n注: 默认搭载的《怪物之锤查询》来自蜜瓜包、October整理\n默认搭载的COC《魔法大典》来自魔骨，NULL，Dr.Amber整理\n默认搭载的DND系列文档来自DicePP项目"
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
@@ -686,22 +686,24 @@ func (d *Dice) registerCoreCommands() {
 	d.CmdMap["査詢"] = cmdFind
 	d.CmdMap["find"] = cmdFind
 
-	helpForHelp := ".help // 查看本帮助\n" +
-		".help 指令 // 查看某指令信息\n" +
-		".help 扩展模块 // 查看扩展信息，如.help coc7\n" +
-		".help 关键字 // 查看任意帮助，同.find\n" +
-		".help reload // 重新加载帮助文档，需要Master权限"
+	helpForHelp := "■ 命运之匣 · 索引\n" +
+		"｜翻阅匣中典籍＼\n" +
+		"————————\n" +
+		"｜.help // 查看本帮助\n" +
+		"｜.help 指令 // 查看某指令信息\n" +
+		"｜.help 扩展模块 // 查看扩展信息，如.help coc7\n" +
+		"｜.help 关键字 // 查看任意帮助，同.find\n" +
+		"｜.help reload // 重新加载帮助文档（仅骰主）\n" +
+		"——————————\n" +
+		"「答案藏于字里行间，求索者自得之」"
 	cmdHelp := &CmdItemInfo{
 		Name:      "help",
 		ShortHelp: helpForHelp,
-		Help:      "帮助指令，用于查看指令帮助和helpdoc中录入的信息:\n" + helpForHelp,
+		Help:      helpForHelp,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			arg := cmdArgs.GetArgN(1)
 			if arg == "" {
-				text := "海豹核心 " + VERSION.String() + "\n"
-				text += "官网: sealdice.com" + "\n"
-				text += "海豹群: 524364253" + "\n"
-				text += DiceFormatTmpl(ctx, "核心:骰子帮助文本_附加说明")
+				text := DiceFormatTmpl(ctx, "核心:骰子帮助文本_附加说明")
 				ReplyToSender(ctx, msg, text)
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
@@ -782,10 +784,19 @@ func (d *Dice) registerCoreCommands() {
 	}
 	d.CmdMap["help"] = cmdHelp
 
+	helpForBot := "■ 命运之匣 · 主宰\n" +
+		"｜执掌匣中诸般权能＼\n" +
+		"————————\n" +
+		"｜.bot on // 在本群开启骰子\n" +
+		"｜.bot off // 在本群关闭骰子\n" +
+		"｜.bot about // 查看骰子信息\n" +
+		"｜.bot bye/exit/quit // 命骰子退出本群\n" +
+		"——————————\n" +
+		"「匣之所在，命运随之流转」"
 	cmdBot := &CmdItemInfo{
 		Name:      "bot",
-		ShortHelp: ".bot on/off/about/bye/quit // 开启、关闭、查看信息、退群",
-		Help:      "骰子管理:\n.bot on/off/about/bye[exit,quit] // 开启、关闭、查看信息、退群",
+		ShortHelp: helpForBot,
+		Help:      helpForBot,
 		Raw:       true,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			inGroup := msg.MessageType == "group"
@@ -945,15 +956,6 @@ func (d *Dice) registerCoreCommands() {
 				return true
 			})
 
-			onlineVer := ""
-			if d.Parent.AppVersionOnline != nil {
-				ver := d.Parent.AppVersionOnline
-				// 如果当前不是最新版，那么提示
-				if ver.VersionLatestCode != VERSION_CODE {
-					onlineVer = "\n最新版本: " + ver.VersionLatestDetail + "\n"
-				}
-			}
-
 			var groupWorkInfo, activeText string
 			if inGroup {
 				activeText = "关闭"
@@ -967,17 +969,7 @@ func (d *Dice) registerCoreCommands() {
 			VarSetValueInt64(ctx, "$t启用群数", int64(activeCount))
 			VarSetValueStr(ctx, "$t群内工作状态", groupWorkInfo)
 			VarSetValueStr(ctx, "$t群内工作状态_仅状态", activeText)
-			ver := VERSION.String()
-			arch := runtime.GOARCH
-			if arch != "386" && arch != "amd64" {
-				ver = fmt.Sprintf("%s %s", ver, arch)
-			}
-			baseText := fmt.Sprintf("SealDice %s%s", ver, onlineVer)
-			extText := DiceFormatTmpl(ctx, "核心:骰子状态附加文本")
-			if extText != "" {
-				extText = "\n" + extText
-			}
-			text := baseText + extText
+			text := DiceFormatTmpl(ctx, "核心:骰子状态附加文本")
 
 			ReplyToSender(ctx, msg, text)
 
@@ -990,7 +982,7 @@ func (d *Dice) registerCoreCommands() {
 	cmdDismiss := &CmdItemInfo{
 		Name:              "dismiss",
 		ShortHelp:         helpForDismiss,
-		Help:              "退群(映射到bot bye):\n" + helpForDismiss,
+		Help:              "■ 命运之匣 · 告别\n｜自此处的叙事中退场＼\n————————\n" + helpForDismiss,
 		Raw:               true,
 		DisabledInPrivate: true,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
@@ -1045,7 +1037,7 @@ func (d *Dice) registerCoreCommands() {
 	cmdBotList := &CmdItemInfo{
 		Name:      "botlist",
 		ShortHelp: botListHelp,
-		Help:      "机器人列表:\n" + botListHelp,
+		Help:      "■ 命运之匣 · 辨识\n｜标记同侪，免于回响纷扰＼\n————————\n" + botListHelp,
 		Raw:       true,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			if ctx.IsPrivate {
@@ -1156,7 +1148,7 @@ func (d *Dice) registerCoreCommands() {
 	cmdMaster := &CmdItemInfo{
 		Name:          "master",
 		ShortHelp:     masterListHelp,
-		Help:          "骰主指令:\n" + masterListHelp,
+		Help:          "■ 命运之匣 · 执权\n｜唯执钥者可号令此匣＼\n————————\n" + masterListHelp,
 		AllowDelegate: true,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			var subCmd string
@@ -1499,12 +1491,18 @@ func (d *Dice) registerCoreCommands() {
 	}
 	d.CmdMap["master"] = cmdMaster
 
-	helpRoll := ".r <表达式> [<原因>] // 骰点指令\n.rh <表达式> <原因> // 暗骰"
+	helpRoll := "■ 命运之匣 · 投掷\n" +
+		"｜将命运掷入这方匣中＼\n" +
+		"————\n" +
+		"｜.r <表达式> [<原因>] // 掷骰\n" +
+		"｜.rh <表达式> <原因> // 暗掷（仅你可见）\n" +
+		"————————\n" +
+		"「骰落定数，匣中藏因果」"
 	cmdRoll := &CmdItemInfo{
 		EnableExecuteTimesParse: true,
 		Name:                    "roll",
 		ShortHelp:               helpRoll,
-		Help:                    "骰点:\n" + helpRoll,
+		Help:                    helpRoll,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			var text string
 			var diceResultExists bool
@@ -1693,6 +1691,9 @@ func (d *Dice) registerCoreCommands() {
 				text = DiceFormatTmpl(ctx, "核心:骰点")
 			}
 
+			// 命运流向: 期望被偏移时追加提示
+			text += FateRollHint(ctx)
+
 			isHide := strings.Contains(cmdArgs.Command, "h")
 
 			// 指令信息
@@ -1748,11 +1749,14 @@ func (d *Dice) registerCoreCommands() {
 		},
 	}
 
-	helpRollX := ".rx <表达式> <原因> // 骰点指令\n.rxh <表达式> <原因> // 暗骰"
+	helpRollX := "■ 命运之匣 · 代掷\n" +
+		"｜.rx <表达式> [<原因>] // 代为掷骰\n" +
+		"｜.rxh <表达式> <原因> // 代为暗掷\n" +
+		"「以他人之名，向命运叩问」"
 	cmdRollX := &CmdItemInfo{
 		Name:          "roll",
 		ShortHelp:     helpRoll,
-		Help:          "骰点(和r相同，但支持代骰):\n" + helpRollX,
+		Help:          helpRollX,
 		AllowDelegate: true,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			mctx := GetCtxProxyFirst(ctx, cmdArgs)
@@ -1770,11 +1774,15 @@ func (d *Dice) registerCoreCommands() {
 	d.CmdMap["rxh"] = cmdRollX
 	d.CmdMap["rhx"] = cmdRollX
 
-	helpExt := ".ext // 查看扩展列表"
+	helpExt := "■ 命运之匣 · 模块\n" +
+		"｜.ext // 查看扩展模块列表\n" +
+		"｜.ext <扩展名> on/off // 开关某扩展\n" +
+		"｜.ext <扩展名> // 查看扩展介绍\n" +
+		"「模块的开合，决定着命运之匣的权能」"
 	cmdExt := &CmdItemInfo{
 		Name:      "ext",
 		ShortHelp: helpExt,
-		Help:      "群扩展模块管理:\n" + helpExt,
+		Help:      helpExt,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			if cmdArgs.IsArgEqual(1, "help") {
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
@@ -1782,7 +1790,9 @@ func (d *Dice) registerCoreCommands() {
 
 			showList := func() {
 				var text strings.Builder
-				text.WriteString("检测到以下扩展(名称-版本-作者)：\n")
+				text.WriteString("■ 模块链路——扩展模块管理系统＼＼＼\n")
+				text.WriteString("｜检测到以下扩展（名称-版本-作者）\n")
+				text.WriteString("——————————\n")
 				for index, i := range ctx.Dice.ExtList {
 					state := "关"
 					for _, j := range ctx.Group.GetActivatedExtList(ctx.Dice) {
@@ -1793,7 +1803,7 @@ func (d *Dice) registerCoreCommands() {
 					}
 					var officialMark string
 					if i.Official {
-						officialMark = "[官方]"
+						officialMark = "〔官方〕"
 					}
 					author := i.Author
 					if author == "" {
@@ -1803,11 +1813,14 @@ func (d *Dice) registerCoreCommands() {
 					if len(i.Aliases) > 0 {
 						aliases = "(" + strings.Join(i.Aliases, ",") + ")"
 					}
-					fmt.Fprintf(&text, "%d. [%s]%s%s %s - %s - %s\n", index+1, state, officialMark, i.Name, aliases, i.Version, author)
+					fmt.Fprintf(&text, "｜〖%d〗[%s]%s%s %s - %s - %s\n", index+1, state, officialMark, i.Name, aliases, i.Version, author)
 				}
-				text.WriteString("使用命令: .ext <扩展名> on/off 可以在当前群开启或关闭某扩展。\n")
-				text.WriteString("使用命令: .ext all on/off 可以在当前群开启或关闭全部扩展。\n")
-				text.WriteString("命令: .ext <扩展名> 可以查看扩展介绍及帮助")
+				text.WriteString("——————————\n")
+				text.WriteString("｜.ext <扩展名> on/off — 开启或关闭某扩展\n")
+				text.WriteString("｜.ext all on/off — 开启或关闭全部扩展\n")
+				text.WriteString("｜.ext <扩展名> — 查看扩展介绍及帮助\n")
+				text.WriteString("——————————\n")
+				text.WriteString("「模块的开合，决定着命运之匣的权能」")
 				ReplyToSender(ctx, msg, text.String())
 			}
 
@@ -2038,7 +2051,7 @@ func (d *Dice) registerCoreCommands() {
 			} else {
 				extName := cmdArgs.Args[0]
 				if i := d.ExtFind(extName, false); i != nil {
-					text := fmt.Sprintf("> [%s] 版本%s 作者%s\n", i.Name, i.Version, i.Author)
+					text := fmt.Sprintf("■ 扩展模块详情\n｜名称：〖%s〗\n｜版本：%s\n｜作者：%s\n——————————\n", i.Name, i.Version, i.Author)
 					i.callWithJsCheck(d, func() {
 						ReplyToSender(ctx, msg, text+i.GetDescText(i))
 					})
@@ -2056,7 +2069,7 @@ func (d *Dice) registerCoreCommands() {
 	cmdNN := &CmdItemInfo{
 		Name:      "nn",
 		ShortHelp: helpNN,
-		Help:      "角色名设置:\n" + helpNN,
+		Help:      "■ 命运之匣 · 称名\n｜为投身叙事者赋名＼\n————————\n" + helpNN,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			val := strings.ToLower(cmdArgs.GetArgN(1))
 			switch val {
@@ -2106,7 +2119,7 @@ func (d *Dice) registerCoreCommands() {
 	d.CmdMap["userid"] = &CmdItemInfo{
 		Name:      "userid",
 		ShortHelp: ".userid // 查看当前帐号和群组ID",
-		Help:      "查看ID:\n.userid // 查看当前帐号和群组ID",
+		Help:      "■ 命运之匣 · 印记\n｜.userid // 查看当前帐号和群组ID\n「每个存在都有其独一的印记」",
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			if cmdArgs.IsArgEqual(1, "help") {
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
@@ -2128,7 +2141,7 @@ func (d *Dice) registerCoreCommands() {
 	cmdSet := &CmdItemInfo{
 		Name:      "set",
 		ShortHelp: helpSet,
-		Help:      "设定骰子面数:\n" + helpSet,
+		Help:      "■ 命运之匣 · 定则\n｜厘定命运之骰的形貌＼\n————————\n" + helpSet,
 		HelpFunc: func(isShort bool) string {
 			text := ".set info // 查看当前面数设置\n"
 			text += ".set <面数> // 设置群内骰子面数\n"
@@ -2274,7 +2287,7 @@ func (d *Dice) registerCoreCommands() {
 	cmdChar := &CmdItemInfo{
 		Name:      "pc",
 		ShortHelp: helpCh,
-		Help:      "角色管理:\n" + helpCh,
+		Help:      "■ 命运之匣 · 化身\n｜管理你在叙事中的化身＼\n————————\n" + helpCh,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) (result CmdExecuteResult) {
 			cmdArgs.ChopPrefixToArgsWith("list", "lst", "load", "save", "del", "rm", "new", "tag", "untagAll", "rename")
 			val1 := cmdArgs.GetArgN(1)
@@ -2628,7 +2641,7 @@ func (d *Dice) registerCoreCommands() {
 	cmdReply := &CmdItemInfo{
 		Name:      "reply",
 		ShortHelp: ".reply on/off",
-		Help:      "打开或关闭自定义回复:\n.reply on/off",
+		Help:      "■ 命运之匣 · 应答\n｜.reply on/off // 开启或关闭自定义回复\n「匣亦能依你所愿，自行应答」",
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			val := cmdArgs.GetArgN(1)
 			switch val {

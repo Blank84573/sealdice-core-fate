@@ -547,6 +547,8 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 					// 是单轮检定，不需要组装成多轮的描述
 					text = textList[0]
 				}
+				// 命运流向: 期望被偏移时追加提示
+				text += FateRollHint(mctx)
 				// 赋值commandItems
 				commandInfo["items"] = commandItems
 				// 设置对应的Command

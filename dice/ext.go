@@ -129,6 +129,8 @@ func (d *Dice) RegisterBuiltinExt() {
 	RegisterBuiltinStory(d)
 	RegisterBuiltinExtExp(d)
 	RegisterBuiltinExtCore(d)
+	RegisterBuiltinExtFate(d)
+	RegisterBuiltinExtIntermission(d)
 
 	d.RegisterBuiltinSystemTemplate()
 }
@@ -217,9 +219,9 @@ func ClearExtStorage(d *Dice, ext *ExtInfo, name string) error {
 
 func GetExtensionDesc(ei *ExtInfo) string {
 	var text strings.Builder
-	text.WriteString("> ")
+	text.WriteString("｜简介：")
 	text.WriteString(ei.Brief)
-	text.WriteString("\n提供指令:\n")
+	text.WriteString("\n——————————\n｜提供指令：\n")
 
 	cmdMap := ei.GetCmdMap()
 	keys := make([]string, 0, len(cmdMap))

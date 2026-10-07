@@ -151,7 +151,7 @@ func (p *PlatformAdapterOnebot) handleGroupDecreaseAction(req gjson.Result, _ *e
 		groupId := FormatOnebotDiceIDQQGroup(req.Get("group_id").String())
 		pendingQuit := p.Session.ConsumePendingQuit(groupId, p.EndPoint.UserID)
 		groupName := p.Session.Parent.Parent.TryGetGroupName(groupId)
-		txt := fmt.Sprintf("离开群组或群解散: <%s>(%s)", groupName, groupId)
+		txt := fmt.Sprintf("■ 命运之匣 · 别离\n｜已离开群组或群组已解散：〖%s〗（%s）\n「缘尽于此，匣门轻合」", groupName, groupId)
 		group, exists := p.Session.ServiceAtNew.Load(groupId)
 		if !exists {
 			txtErr := fmt.Sprintf("离开群组或群解散，删除对应群聊信息失败: <%s>(%s)", groupName, groupId)
@@ -209,14 +209,13 @@ func (p *PlatformAdapterOnebot) handleGroupBanAction(req gjson.Result, _ *evsock
 	groupId := FormatOnebotDiceIDQQGroup(req.Get("group_id").String())
 	operatorID := FormatOnebotDiceIDQQ(req.Get("operator_id").String())
 	durationTime := int(req.Get("duration").Int())
-	duration := time.Duration(durationTime) * time.Second
 	switch subType {
 	case "ban":
 		if userID == selfID {
 			groupName := p.Session.Parent.Parent.TryGetGroupName(groupId)
 			userName := p.Session.Parent.Parent.TryGetUserName(operatorID)
 			ctx.Dice.Config.BanList.AddScoreByGroupMuted(operatorID, groupId, ctx)
-			txt := fmt.Sprintf("被禁言: 在群组<%s>(%s)中被禁言，时长%d秒，操作者:<%s>(%s)", groupName, groupId, duration, userName, operatorID)
+			txt := fmt.Sprintf("■ 命运之匣 · 缄默降临\n｜在群组〖%s〗（%s）中被禁言\n｜时长：〖%d〗秒\n｜操作者：〖%s〗（%s）", groupName, groupId, durationTime, userName, operatorID)
 			p.logger.Info(txt)
 			ctx.Notice(txt)
 		}
@@ -361,7 +360,7 @@ func (p *PlatformAdapterOnebot) handleReqGroupAction(req gjson.Result, _ *evsock
 		}
 		// 没问题，加群
 		_ = ants.Submit(func() {
-			txt := fmt.Sprintf("收到QQ加群邀请: 群组<%s>(%s) 邀请人:<%s>(%s)", res.GroupName, res.GroupId, userName, diceUserId)
+			txt := fmt.Sprintf("■ 命运之匣 · 群组邀请\n｜收到新的群组邀请＼\n｜群组：〖%s〗（%s）\n｜邀请人：〖%s〗（%s）", res.GroupName, res.GroupId, userName, diceUserId)
 			p.logger.Info(txt)
 			ctx.Notice(txt)
 			err := p.sendEmitter.SetGroupAddRequest(p.ctx, req.Get("flag").String(), true, "")
@@ -422,7 +421,7 @@ func (p *PlatformAdapterOnebot) handleReqFriendAction(req gjson.Result, _ *evsoc
 	if p.IgnoreFriendRequest {
 		extra += "。由于设置了忽略邀请，此信息仅为通报"
 	}
-	txt := fmt.Sprintf("收到QQ好友邀请: 邀请人:%s, 验证信息: %s, 是否自动同意: %t%s", req.Get("user_id").String(), comment, passQuestion && result.Passed, extra)
+	txt := fmt.Sprintf("■ 命运之匣 · 友谊缔结\n｜收到好友邀请＼\n｜邀请人：〖%s〗\n｜验证信息：%s\n｜是否自动接纳：%t%s", req.Get("user_id").String(), comment, passQuestion && result.Passed, extra)
 	p.logger.Info(txt)
 	ctx.Notice(txt)
 	// 若忽略邀请，对操作不通过也不拒绝，哪怕他是黑名单里的

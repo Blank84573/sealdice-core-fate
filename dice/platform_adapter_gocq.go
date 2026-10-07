@@ -639,7 +639,7 @@ func (pa *PlatformAdapterGocq) Serve() int {
 			uid := FormatDiceIDQQ(string(msgQQ.UserID))
 			groupName := dm.TryGetGroupName(msg.GroupID)
 			userName := dm.TryGetUserName(uid)
-			txt := fmt.Sprintf("收到QQ加群邀请: 群组<%s>(%s) 邀请人:<%s>(%s)", groupName, msgQQ.GroupID, userName, msgQQ.UserID)
+			txt := fmt.Sprintf("■ 命运之匣 · 群组邀请\n｜收到新的群组邀请＼\n｜群组：〖%s〗（%s）\n｜邀请人：〖%s〗（%s）", groupName, msgQQ.GroupID, userName, msgQQ.UserID)
 			log.Info(txt)
 			ctx.Notice(txt)
 			tempInviteMap[msg.GroupID] = time.Now().Unix()
@@ -754,7 +754,7 @@ func (pa *PlatformAdapterGocq) Serve() int {
 				extra += "。由于设置了忽略邀请，此信息仅为通报"
 			}
 
-			txt := fmt.Sprintf("收到QQ好友邀请: 邀请人:%s, 验证信息: %s, 是否自动同意: %t%s", msgQQ.UserID, comment, willAccept, extra)
+			txt := fmt.Sprintf("■ 命运之匣 · 友谊缔结\n｜收到好友邀请＼\n｜邀请人：〖%s〗\n｜验证信息：%s\n｜是否自动接纳：%t%s", msgQQ.UserID, comment, willAccept, extra)
 			log.Info(txt)
 			ctx.Notice(txt)
 
@@ -889,7 +889,7 @@ func (pa *PlatformAdapterGocq) Serve() int {
 					pa.SendToGroup(ctx, msg.GroupID, strings.TrimSpace(i), "")
 				}
 			}()
-			txt := fmt.Sprintf("加入QQ群组: <%s>(%s)", groupName, msgQQ.GroupID)
+			txt := fmt.Sprintf("■ 命运之匣 · 抵达新群\n｜已加入群组〖%s〗（%s）\n「于此地，命运之匣再度开启」", groupName, msgQQ.GroupID)
 			log.Info(txt)
 			ctx.Notice(txt)
 			if groupInfo, ok := ctx.Session.ServiceAtNew.Load(msg.GroupID); ok {
@@ -986,7 +986,7 @@ func (pa *PlatformAdapterGocq) Serve() int {
 			// {"group_id":564808710,"notice_type":"group_decrease","operator_id":2589922907,"post_type":"notice","self_id":2589922907,"sub_type":"leave","time":1651584460,"user_id":2589922907}
 			pendingQuit := session.ConsumePendingQuit(msg.GroupID, ep.UserID)
 			groupName := dm.TryGetGroupName(msg.GroupID)
-			txt := fmt.Sprintf("离开群组或群解散: <%s>(%s)", groupName, msgQQ.GroupID)
+			txt := fmt.Sprintf("■ 命运之匣 · 别离\n｜已离开群组或群组已解散：〖%s〗（%s）\n「缘尽于此，匣门轻合」", groupName, msgQQ.GroupID)
 			// 这个就是要删除的部分，离开这个群组=群组退出=删除对应的群聊绑定信息（也就是用户的骰子和这个群聊无关了）
 			// 同时考虑到：QQ群团队发布公告称，由于业务调整，“恢复QQ群”功能将于2023年10月13日起正式下线，届时涉及QQ群相关的恢复功能都将无法使用，可以安心删除群聊对应绑定信息。
 			group, exists := session.ServiceAtNew.Load(msg.GroupID)
@@ -1017,7 +1017,7 @@ func (pa *PlatformAdapterGocq) Serve() int {
 				userName := dm.TryGetUserName(opUID)
 
 				ctx.Dice.Config.BanList.AddScoreByGroupMuted(opUID, msg.GroupID, ctx)
-				txt := fmt.Sprintf("被禁言: 在群组<%s>(%s)中被禁言，时长%d秒，操作者:<%s>(%s)", groupName, msgQQ.GroupID, msgQQ.Duration, userName, msgQQ.OperatorID)
+				txt := fmt.Sprintf("■ 命运之匣 · 缄默降临\n｜在群组〖%s〗（%s）中被禁言\n｜时长：〖%d〗秒\n｜操作者：〖%s〗（%s）", groupName, msgQQ.GroupID, msgQQ.Duration, userName, msgQQ.OperatorID)
 				log.Info(txt)
 				ctx.Notice(txt)
 			}

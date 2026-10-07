@@ -1,0 +1,41 @@
+name: Build Js Port
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.19'
+
+    - name: Install gopherjs
+      run: |
+        go install github.com/gopherjs/gopherjs@v1.19.0-beta2
+        go mod download golang.org/x/exp
+
+    - name: Build
+      run: gopherjs build -m -o jsport/dicescript.cjs github.com/sealdice/dicescript/jsport
+
+    - name: Setup pnpm
+      uses: pnpm/action-setup@v4
+      with:
+        version: 9
+
+    - name: Bundle ESM
+      run: cd ./jsport && pnpm install && pnpm build
+
+    - name: Deploy
+      uses: peaceiris/actions-gh-pages@v4
+      with:
+        github_token: ${{ secrets.MY_TOKEN }}
+        publish_dir: ./jsport
+        exclude_assets: './node_modules,./dicescript.cjs,./dicescript.cjs.map'
+        force_orphan: true
